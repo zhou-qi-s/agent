@@ -1,0 +1,107 @@
+server:
+  iP: http://192.168.0.3
+  port: 30000
+  compartment: CPT-CMD-004
+  type: GENERAL, DISPLAY_CONSOLE, PLUGIN, HARBOR, KUBERNETES, SOFTWARE_REPO, VIRTUAL_MACHINE, CONTAINER
+  redis:
+    host: 192.168.0.3
+    port: 6379
+    db: 0
+    password: 
+    lettuce:
+      pool:
+        max_connections: 8 # 连接池最大连接数
+        socket_timeout: 15 # 读写超时，需大于任务阻塞读取超时时间
+        socket_connect_timeout: 10 #连接超时
+  download: /var/cache/agent/download #默认下载地址
+  network_interface: "wlp0s20f3" # 指定网卡名称（如 eth0、以太网），留空则自动检测
+  # FastAPI 配置
+  fastapi:
+    host: 0.0.0.0 # listen all interfaces
+    port: 8000 # FastAPI 端口
+    workers: 1   # 工作进程数
+harbor:
+  agreement: https://
+  username: admin
+  password: 12345
+  download: /var/cache/agent/tools #镜像临时存放地址
+  project: tools
+  template: helm
+  port: 443
+helm:
+  config: /etc/kubernetes/admin.conf
+  index_key: helm:release:index       # ZSET 索引
+  data_prefix: "helm:release:data:"   # HASH 详情前缀
+interface:
+  register: /api/agent/register #注册
+  task_report: /api/agent/task_report #任务结果上报
+  xkt_report: /api/agent/xkt_report #xkt进程监控上报
+  alarm: /api/agent/alarm #告警上报
+  # nacos注册接口
+  registerUrl: /api/component/register
+  # nacos注销接口
+  deregisterUrl: /api/component/deregister
+version: 1.0.0
+nacos:
+  ip: 192.168.0.5
+  port: 8848
+  # 认证
+  username: nacos
+  password: 123456
+
+  # 常用接口
+  api:
+    register: /nacos/v1/ns/instance          # 注册实例
+    deregister: /nacos/v1/ns/instance        # 删除实例
+    update: /nacos/v1/ns/instance            # 更新实例
+    heartbeat: /nacos/v1/ns/instance/beat    # 发送心跳
+    instance_list: /nacos/v1/ns/instance/list # 查询实例列表
+    service_list: /nacos/v1/ns/service/list  # 查询服务列表
+    service_detail: /nacos/v1/ns/service     # 查询服务详情
+    alarm_report: /nacos/v1/ns/alarm/send     # 上报告警
+agent:
+  retry:
+    count: 5        # 最大重试次数
+    interval: 3     # 重试间隔秒
+
+  heartbeat:
+    interval: 5    # 心跳间隔秒
+  process:
+    upload: 10 #进程信息上传间隔
+
+upload_interval: 10 # 上报间隔秒
+package:
+  json_target_path: /var/cache/agent/json_target # 显控台json文件地址
+k8s:
+  download: /etc/kubernetes/admin.conf
+  kubeconfig: /etc/kubernetes/admin.conf
+  deps_dir: /var/cache/agent//offline  # k8s依赖包下载目录
+  cookie: ""  # 下载K8S离线包的Cookie认证（可选）
+  # 安装脚本参数
+  scheme: B  # 安装方案
+  hostname: master1  # 主机名
+  nodes: "master1:192.168.86.183"  # 节点列表
+  ssh_pass: "kylin-999"  # SSH密码
+  
+  # 脚本执行完成后执行的命令
+  post_script: ""  # 如: kubectl get nodes
+
+app_store:
+  # 注意: 地址必须是 Agent 可访问的 app_store 登录接口，登录成功返回 {"code":0,"token":"..."}
+  address: http://192.168.0.5:8099/appStore/admin/login
+  username: admin
+  password: admin
+
+# 日志采集配置：使用 promtail 采集本地应用日志推送到 Loki
+log_collect:
+  enabled: true          # 是否启用日志采集
+  loki_url: http://192.168.0.5:31000/loki/api/v1/push  # Loki push 接口地址
+  job: app               # 应用名（作为 job 标签，前端按此区分）
+  namespace: "{app}"     # 命名空间标签：{app} 表示从日志文件名自动提取应用名（前端命名空间下拉框按此显示）
+  paths:                 # 日志文件路径列表（支持通配符，如 /var/log/*.log）
+    - /var/log/*.log     # 监控 /var/log 下所有应用日志（ganet 部署的应用日志都放这里）
+  promtail:              # promtail 配置
+    path: /usr/local/bin/promtail  # promtail 可执行文件路径
+    config: /var/cache/agent/promtail.yaml          # promtail 配置文件生成位置
+    positions: /var/cache/agent/promtail-positions.yaml  # 断点续传位置文件
+  
