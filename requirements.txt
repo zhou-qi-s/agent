@@ -1,0 +1,24 @@
+# 基础依赖
+psutil==5.9.0
+requests==2.31.0
+redis==5.0.1
+PyYAML==6.0.1
+GPUtil==1.4.0
+
+# FastAPI 相关依赖
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+
+# 可选：如果需要 WebSocket
+websockets==12.0
+
+# 开发工具
+pytest==7.4.3
+black==23.11.0
+flake8==6.1.0
+pyinstaller>=6.15.0
+nuitka>=2.6
+ordered-set>=4.1.0
+zstandard>=0.22.0
