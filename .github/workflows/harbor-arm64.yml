@@ -1,0 +1,93 @@
+name: Build Harbor ARM64 Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      harbor_version:
+        description: "Harbor version tag"
+        required: true
+        default: "v2.15.0"
+
+jobs:
+  build-harbor-arm64:
+    name: Build Harbor ARM64 (${{ github.event.inputs.harbor_version }})
+    # 关键：原生 ARM64 runner，避免 QEMU 模拟导致的极慢构建
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 350
+
+    steps:
+      - name: Show runner info
+        run: |
+          uname -m
+          echo "---"
+          docker version --format '{{.Server.Version}}'
+          docker buildx version
+          df -h /
+
+      - name: Download Harbor source
+        run: |
+          V="${{ github.event.inputs.harbor_version }}"
+          curl -L -m 600 --retry 3 -o harbor-src.tar.gz \
+            "https://github.com/goharbor/harbor/archive/refs/tags/${V}.tar.gz"
+          tar -xzf harbor-src.tar.gz
+          ls -d harbor-*
+
+      - name: Patch arch hardcode
+        run: |
+          V="${{ github.event.inputs.harbor_version }}"
+          cd "harbor-${V#v}"
+          # 源码中唯一硬编码：exporter 的 GOARCH=amd64
+          if grep -q "ENV GOARCH=amd64" make/photon/exporter/Dockerfile; then
+            sed -i 's/ENV GOARCH=amd64/ENV GOARCH=arm64/' make/photon/exporter/Dockerfile
+            echo "patched exporter GOARCH -> arm64"
+          fi
+          grep -n "GOARCH" make/photon/exporter/Dockerfile || true
+
+      - name: Build Harbor images (native arm64)
+        run: |
+          V="${{ github.event.inputs.harbor_version }}"
+          cd "harbor-${V#v}"
+          export VERSIONTAG="${V}"
+          export BASEIMAGETAG="${V}"
+          echo "=== build base images ==="
+          make build -j4 2>&1 | tail -120 || true
+          echo ""
+          echo "=== images ==="
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+      - name: Verify architectures
+        run: |
+          V="${{ github.event.inputs.harbor_version }}"
+          echo "=== arch check ==="
+          for img in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^goharbor/'); do
+            a=$(docker image inspect "$img" --format '{{.Architecture}}' 2>/dev/null)
+            echo "  $img -> $a"
+          done
+
+      - name: Save images to tarball
+        run: |
+          V="${{ github.event.inputs.harbor_version }}"
+          IMGS=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^goharbor/')
+          echo "saving:"
+          echo "$IMGS"
+          docker save -o harbor-arm64-images.tar $IMGS
+          ls -lh harbor-arm64-images.tar
+          gzip -1 harbor-arm64-images.tar
+          ls -lh harbor-arm64-images.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-arm64-images
+          path: harbor-arm64-images.tar.gz
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            harbor-*/build*.log
+          retention-days: 3
+          if-no-files-found: ignore
