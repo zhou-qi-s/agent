@@ -1,0 +1,851 @@
+"""
+插件应用下载任务模块
+
+与 download.py 结构完全对齐，唯一区别：
+  1. 路径多一层 plugin/ 子目录
+  2. task_type 为 plugin_download
+  3. 成功状态码为 8（插件下载成功约定）
+
+version 为必传参数：下载前 {file_name}/runtime/config.yaml 尚不存在，无法从配置文件读取版本号。
+"""
+
+import hashlib
+import logging
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+from typing import Any, Dict, Optional
+
+import requests
+import yaml
+
+from utils import util
+from utils.config_loader import load_config
+
+
+# ── YAML flow-style 辅助类：使内层 dict 输出为紧凑的 {} 格式 ──
+class FlowDict(dict):
+    """标记 dict 在 YAML dump 时使用 flow style（紧凑 JSON 风格）"""
+    pass
+
+
+def _flowdict_representer(dumper, data):
+    return dumper.represent_mapping('tag:yaml.org,2002:map', data, flow_style=True)
+
+
+yaml.add_representer(FlowDict, _flowdict_representer)
+
+# =============================================================================
+# 全局配置（模块加载时一次性读取 config.yaml，所有方法统一使用）
+# =============================================================================
+
+# 加载完整配置文件，load_config 内置缓存，多次调用也只会读取一次
+_CONFIG = load_config()
+
+# ── app_store 配置 ──
+# app_store 用于 Linux 系统下载文件前的认证登录，获取 token
+_APP_STORE_CFG = _CONFIG.get("app_store", {})
+_APP_STORE_ADDRESS = _APP_STORE_CFG.get("address", "")  # 登录接口地址
+_APP_STORE_USERNAME = _APP_STORE_CFG.get("username", "")  # 登录用户名
+_APP_STORE_PASSWORD = _APP_STORE_CFG.get("password", "")  # 登录密码
+_SERVER = _CONFIG.get("server", {})
+_SERVER_IP = _SERVER.get("ip", "")
+_SERVER_PORT = _SERVER.get("port", "")
+# interface 是顶层节点，包含 registerUrl / deregisterUrl 等路径
+_INTERFACE = _CONFIG.get("interface", {}) or {}
+_INTERFACE_REGISTER_URL = _INTERFACE.get("registerUrl", "")
+_INTERFACE_DEREGISTER_URL = _INTERFACE.get("deregisterUrl", "")
+# ── server 配置 ──
+_SERVER_CFG = _CONFIG.get("server", {})
+
+# 默认下载目录（config.yaml 中 server.download 字段）
+_DEFAULT_DOWNLOAD_PATH = _SERVER_CFG.get("download", "download")
+
+# 插件应用应用的子目录前缀（与一般下载的唯一路径差异）
+_DISPLAY_CONSOLE_PREFIX = "plugin"
+
+
+# =============================================================================
+# 系统检测
+# =============================================================================
+
+def _is_windows() -> bool:
+    """检测当前系统是否为 Windows"""
+    return sys.platform == "win32"
+
+
+def _is_linux() -> bool:
+    """检测当前系统是否为 Linux"""
+    return sys.platform.startswith("linux")
+
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+def _get_app_store_config() -> dict:
+    """
+    获取 app_store 配置（直接返回模块级变量，无需重复读文件）
+
+    返回:
+        dict: app_store 配置字典
+    """
+    return _APP_STORE_CFG
+
+
+def _login_app_store() -> str:
+    """
+    登录 app_store 获取 Token（使用模块级配置变量，无需每次调用 load_config()）
+
+    返回:
+        登录成功返回token，失败返回空字符串
+    """
+    # 直接使用模块级全局配置变量
+    address = _APP_STORE_ADDRESS
+    username = _APP_STORE_USERNAME
+    password = _APP_STORE_PASSWORD
+
+    if not address or not username or not password:
+        logging.warning(f"[插件下载] app_store配置不完整，跳过登录 (address={address or '<空>'})")
+        return ""
+
+    try:
+        logging.info(f"[插件下载] 尝试登录app_store: {address}")
+        response = requests.post(
+            address,
+            json={"username": username, "password": password},
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            token = result.get("token", "")
+            logging.info(f"[插件下载] app_store登录成功，获取Token (address={address})")
+            return token
+        else:
+            logging.warning(f"[插件下载] app_store登录失败: HTTP {response.status_code}, address={address}")
+            return ""
+
+    except Exception as e:
+        logging.error(f"[插件下载] 登录app_store异常: {e}, address={address}")
+        return ""
+
+
+def check_md5(file_path: str, expected_md5: str) -> bool:
+    """
+    检查文件的MD5值
+
+    参数:
+        file_path: 文件路径
+        expected_md5: 期望的MD5值
+
+    返回:
+        bool: MD5是否匹配
+    """
+    import hashlib
+
+    md5_hash = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            md5_hash.update(chunk)
+    return md5_hash.hexdigest() == expected_md5
+
+
+# =============================================================================
+# 结果构建
+# =============================================================================
+
+def _build_download_result(
+        task_id: str,
+        result: bool,
+        message: str,
+        data: Optional[Dict[str, Any]] = None,
+        error_type: str = "",
+        error_message: str = "",
+        tb: str = ""
+) -> Dict[str, Any]:
+    """
+    构建插件下载任务统一返回结构，供 plugin_download_task 及其他下载相关方法复用。
+
+    参数:
+        task_id:      任务ID
+        result:       执行结果 True/False
+        message:      结果描述
+        data:         附加数据字典
+        error_type:   错误类型标识
+        error_message:错误详细描述
+        tb:           traceback 字符串
+
+    返回:
+        标准化的任务结果字典
+    """
+    payload = {
+        "ip": util.get_ip() or "unknown",
+        "task_id": task_id,
+        "result": result,
+        "task_type": "plugin_download",
+        "status": 8 if result else 12,
+        "message": message,
+        "data": {
+            **(data or {}),
+            "error_type": error_type,
+            "error_message": error_message,
+            "traceback": tb
+        }
+    }
+    return payload
+
+
+# =============================================================================
+# 读取 runtime/config.yaml
+# =============================================================================
+
+def _read_runtime_config(save_path: str, file_name: str, sub_dir: str = "plugin") -> Dict[str, Any]:
+    """
+    从 {save_path}/{sub_dir}/{file_name}/runtime/config.yaml 读取服务版本和 Nacos 配置。
+
+    注意: plugin_download.py 不再调用此函数（下载前该文件尚不存在，version 由参数显式传入）。
+    保留该函数仅因为其他模块可能 import 使用。
+
+    返回:
+        解析后的配置字典，文件不存在或读取失败返回空 dict
+    """
+    config_path = os.path.join(save_path, sub_dir, file_name, "runtime", "config.yaml")
+    if not os.path.isfile(config_path):
+        logging.warning("[插件下载] runtime/config.yaml 不存在: %s", config_path)
+        return {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        logging.info("[插件下载] 已从 runtime/config.yaml 读取配置: %s", config_path)
+        return config if isinstance(config, dict) else {}
+    except Exception as e:
+        logging.error("[插件下载] 读取 runtime/config.yaml 失败: %s -> %s", config_path, e)
+        return {}
+
+
+# =============================================================================
+# 参数校验
+# =============================================================================
+
+def _validate_and_extract_params(parameters: Dict[str, Any]) -> tuple:
+    """
+    校验必传参数并提取参数值。
+    version 为必传参数：下载前 {file_name}/runtime/config.yaml 尚不存在，无法从配置文件读取版本号。
+
+    返回:
+        (error_result, params_dict)
+        - 校验失败: (error_result, None)
+        - 校验通过: (None, params_dict)
+    """
+    task_id = parameters.get('task_id', '')
+
+    def _fail(msg: str, error_type: str, error_message: str):
+        return (
+            _build_download_result(task_id, False, msg,
+                                   error_type=error_type, error_message=error_message),
+            None
+        )
+
+    # 基础必传参数
+    if not task_id:
+        logging.error("[插件下载] 参数缺失: task_id")
+        return _fail("参数缺失: task_id", "ParameterMissing", "task_id 参数缺失")
+
+    download_url = parameters.get('download_url', '')
+    if not download_url:
+        logging.error("[插件下载] 参数缺失: download_url")
+        return _fail("参数缺失: download_url", "ParameterMissing",
+                     "download_url 参数缺失")
+
+    # save_path 从 config.yaml 的 server.download 读取，不从参数传入
+    save_path = _DEFAULT_DOWNLOAD_PATH
+    if not save_path:
+        logging.error("[插件下载] config.yaml 中未配置 server.download")
+        return _fail("配置缺失: server.download", "ConfigMissing",
+                     "config.yaml 中未配置 server.download")
+
+    custom_file_name = str(parameters.get('file_name', '') or '').strip()
+    if not custom_file_name:
+        logging.error("[插件下载] 参数缺失: file_name")
+        return _fail("参数缺失: file_name", "ParameterMissing", "file_name 参数缺失")
+
+    # 兼容旧字段名 suffix（plugin_upgrade.py 仍用该字段），新流程统一为 file_suffix
+    file_suffix = parameters.get('file_suffix', '') or parameters.get('suffix', '')
+    if not file_suffix:
+        logging.error("[插件下载] 文件后缀参数缺失: file_suffix")
+        return _fail("参数缺失: file_suffix", "ParameterMissing", "file_suffix 参数缺失")
+
+    # version 为必传参数：下载前 runtime/config.yaml 尚不存在，版本号必须由调用方显式传入
+    version = str(parameters.get('version', '') or '').strip()
+    if not version:
+        logging.error("[插件下载] 参数缺失: version")
+        return _fail("参数缺失: version", "ParameterMissing",
+                     "version 参数缺失，下载前无法从 runtime/config.yaml 读取版本")
+
+    params = {
+        'task_id': task_id,
+        'download_url': download_url,
+        'save_path': save_path,
+        'file_name': custom_file_name,
+        'file_suffix': file_suffix,
+        'version': version,
+    }
+
+    return None, params
+
+
+# =============================================================================
+# 服务数据构建
+# =============================================================================
+
+def _build_service_data(file_name: str, version: str = "") -> Dict[str, Any]:
+    """构建服务相关字段（组件尚未下载，无 runtime/config.yaml 可读，使用默认值），用于填充返回结果的 data 字段"""
+    return {
+        "displayName": file_name,
+        "version": version,
+        "description": "",
+        "serviceName": file_name,
+        "groupName": "DEFAULT_GROUP",
+        "clusterName": "DEFAULT",
+        "weight": 1.0,
+        "healthy": True,
+        "enabled": True,
+        "ephemeral": True,
+        "metadata": {},
+    }
+
+
+# =============================================================================
+# 下载环境准备（目录、版本检查、application.yml）
+# =============================================================================
+
+def _prepare_download_environment(
+        task_id: str,
+        save_path: str,
+        file_name: str,
+        version: str,
+        sub_dir: str = "plugin",
+) -> tuple:
+    """
+    准备插件下载目录结构：找 {sub_dir}/file_name 目录（不存在则创建）、找版本号目录（不存在则创建）。
+    版本号目录下已有文件时直接覆盖重新下载（与 download.py 行为一致）。
+    版本号仅从参数传入（下载前 {file_name}/runtime/config.yaml 尚不存在，无法读取）。
+    路径比 download.py 多一层 {sub_dir}/（插件应用专属子目录 plugin）。
+
+    参数:
+        task_id:        任务ID
+        save_path:      保存根目录
+        file_name:      文件名（不含后缀），即服务名
+        version:        版本号（参数必传）
+        sub_dir:        专属子目录（默认 plugin）
+
+    返回:
+        (error_result, save_dir, version_dir)
+        - 出错: (error_result, "", "")
+        - 正常: (None, save_dir, version_dir)
+    """
+    # ── 版本号：仅从参数取（下载前 runtime/config.yaml 尚不存在）──
+    version = (version or "").strip()
+    if not version:
+        return (
+            _build_download_result(task_id, False, "缺少版本号: 未传入 version 参数",
+                                   error_type="VersionMissing",
+                                   error_message="下载前无法读取 runtime/config.yaml，version 必须由参数显式传入"),
+            "", ""
+        )
+
+    # 检查 save_path 是否为目录
+    if os.path.exists(save_path) and not os.path.isdir(save_path):
+        logging.error(f"[插件下载] save_path 不是目录: {save_path}")
+        return (
+            _build_download_result(task_id, False, "save_path 必须为目录路径",
+                                   error_type="InvalidSavePath",
+                                   error_message="save_path 必须为目录路径，不能是文件路径"),
+            "", ""
+        )
+
+    # 创建 save_path/{sub_dir}/file_name 子文件夹（不存在则创建）
+    save_dir = os.path.join(save_path, sub_dir, file_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 版本号目录：不存在则创建
+    version_dir = os.path.join(save_dir, version)
+    os.makedirs(version_dir, exist_ok=True)
+
+    # 版本号目录下已有文件 → 直接覆盖重新下载（不再提示已存在）
+    if os.listdir(version_dir):
+        logging.info(f"[插件下载] 版本目录下已有文件，将直接覆盖重新下载: {version_dir}")
+        # 清空旧内容：残留的 bin/、nginx.conf 等旧文件会干扰 _strip_single_top_dir 的
+        # "恰好一个子目录、无其他顶层文件"判定，导致压缩包顶层目录无法剥离、脚本定位失效。
+        for _old_name in os.listdir(version_dir):
+            _old_path = os.path.join(version_dir, _old_name)
+            if os.path.isdir(_old_path) and not os.path.islink(_old_path):
+                shutil.rmtree(_old_path)
+            else:
+                os.remove(_old_path)
+        logging.info(f"[插件下载] 已清空版本目录旧内容: {version_dir}")
+
+    # 写入版本文件
+    version_file = os.path.join(save_dir, "version")
+    try:
+        with open(version_file, "w", encoding="utf-8") as vf:
+            vf.write(version)
+    except Exception as e:
+        logging.error(f"[插件下载] 写入版本文件失败: {e}")
+        return (
+            _build_download_result(task_id, False, f"写入版本文件失败: {e}",
+                                   error_type="VersionFileWriteError", error_message=str(e)),
+            "", ""
+        )
+
+    logging.info(f"[插件下载] 创建版本目录: {version_dir}")
+
+    # ── 构建 platform 节点（来源为全局 config.yaml，与组件无关）──
+    platform_cfg = {}
+    if _SERVER_IP:
+        platform_cfg["host"] = _SERVER_IP
+    if _SERVER_PORT:
+        try:
+            platform_cfg["port"] = int(_SERVER_PORT)
+        except (ValueError, TypeError):
+            logging.warning(f"[插件下载] server.port 不是有效整数: {_SERVER_PORT}，已忽略")
+    if _INTERFACE_REGISTER_URL:
+        platform_cfg["registerUrl"] = _INTERFACE_REGISTER_URL
+    if _INTERFACE_DEREGISTER_URL:
+        platform_cfg["deregisterUrl"] = _INTERFACE_DEREGISTER_URL
+    if not platform_cfg:
+        logging.warning("[插件下载] platform 配置缺失，application.yml 将不包含 platform 节点")
+    if not _SERVER_IP:
+        logging.warning("[插件下载] server.ip 未配置，platform.host 将缺失")
+
+    # ── 拼装 application.yml 内容（不读 runtime/config.yaml，nacos 节点由后续注册流程补充）──
+    app_yml_content = {
+        "component": {
+            "name": file_name,
+            "displayName": file_name,
+            "version": version,
+            "type": "MASTER",
+            "description": "",
+        },
+    }
+    if platform_cfg:
+        app_yml_content["platform"] = platform_cfg
+    app_yml_path = os.path.join(version_dir, "application.yml")
+    try:
+        with open(app_yml_path, "w", encoding="utf-8") as yf:
+            yaml.dump(app_yml_content, yf, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        logging.info(f"[插件下载] 生成组件描述文件: {app_yml_path}")
+    except Exception as e:
+        logging.error(f"[插件下载] 生成 application.yml 失败: {e}")
+        return (
+            _build_download_result(task_id, False, f"生成 application.yml 失败: {e}",
+                                   error_type="AppYmlWriteError", error_message=str(e)),
+            "", ""
+        )
+
+    return None, save_dir, version_dir
+
+
+# =============================================================================
+# 文件下载（含重试）
+# =============================================================================
+
+def _download_file(
+        task_id: str,
+        download_url: str,
+        target_file_path: str,
+        retry: int,
+        timeout: int,
+        token: str,
+) -> Dict[str, Any]:
+    """
+    执行文件下载，支持重试机制和完整性校验。
+
+    返回:
+        标准化的任务结果字典
+    """
+    tmp_path = target_file_path + ".tmp"
+
+    # URL 容错: app_store 下载接口第一段路径拼写纠正（下发方曾用 appStrore/appstore，正确为 appStore）
+    m = re.match(r'^(https?://[^/]+/)app(store|Strore)/', download_url, flags=re.IGNORECASE)
+    if m and m.group(2) != "Store":
+        corrected_url = m.group(1) + "appStore/" + download_url[m.end():]
+        logging.warning(f"[插件下载] 下载URL拼写错误({m.group(2)})已纠正为: {corrected_url}")
+        download_url = corrected_url
+
+    # 清理残留临时文件
+    if os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+            logging.info(f"[插件下载] 删除残留临时文件: {tmp_path}")
+        except Exception as e:
+            logging.warning(f"[插件下载] 删除残留临时文件失败: {e}")
+
+    # 覆盖已存在文件
+    if os.path.exists(target_file_path):
+        logging.info(f"[插件下载] 文件已存在，将覆盖重新下载: {target_file_path}")
+        os.remove(target_file_path)
+
+    # 下载重试循环
+    for attempt in range(retry + 1):
+        try:
+            logging.info(f"[插件下载] 下载尝试 {attempt + 1}/{retry + 1}")
+
+            headers = {}
+            if token:
+                headers["token"] = token
+
+            response = requests.get(download_url, headers=headers, stream=True, timeout=timeout)
+            response.raise_for_status()
+
+            with open(tmp_path, "wb") as f:
+                for chunk in response.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+
+            # 大小校验
+            actual_size = os.path.getsize(tmp_path)
+            if actual_size == 0:
+                raise ValueError("下载文件大小为0，可能是空文件")
+
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                expected_size = int(content_length)
+                if actual_size != expected_size:
+                    raise ValueError(
+                        f"下载文件不完整: 期望大小 {expected_size} 字节, 实际大小 {actual_size} 字节"
+                    )
+            logging.info(f"[插件下载] 完整性校验通过，文件大小: {actual_size} 字节")
+
+            # 移动到最终位置
+            os.replace(tmp_path, target_file_path)
+            file_size = os.path.getsize(target_file_path)
+            logging.info(f"[插件下载] 下载成功: {target_file_path}, 大小: {file_size} bytes")
+
+            return _build_download_result(task_id, True, "下载成功", data={
+                "status": "downloaded",
+                "file_path": target_file_path,
+                "file_size": file_size,
+                "attempts": attempt + 1,
+            })
+
+        except Exception as e:
+            logging.error(f"[插件下载] 下载失败 (尝试 {attempt + 1}): {e}")
+
+            cleanup_success = False
+            cleanup_error = ""
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                    cleanup_success = True
+                except Exception as rm_err:
+                    cleanup_error = str(rm_err)
+
+            if attempt < retry:
+                logging.info("[插件下载] 2秒后重试...")
+                time.sleep(2)
+                continue
+
+            logging.error(f"[插件下载] 下载任务失败，已重试 {retry} 次")
+            return _build_download_result(task_id, False, f"下载失败: {str(e)}", data={
+                "download_url": download_url,
+                "file_path": target_file_path,
+                "attempts": retry + 1,
+                "cleanup_result": {"success": cleanup_success, "error": cleanup_error}
+            }, error_type=type(e).__name__, error_message=str(e), tb=traceback.format_exc())
+
+    return _build_download_result(task_id, False, "下载失败，超出重试次数", data={
+        "download_url": download_url,
+        "file_path": target_file_path,
+        "attempts": retry + 1
+    }, error_type="MaxRetriesExceeded", error_message="超出最大重试次数")
+
+
+# =============================================================================
+# 压缩包解压
+# =============================================================================
+
+def _extract_archive(archive_path: str, dest_dir: str) -> bool:
+    """
+    解压压缩包到目标目录。
+
+    参数:
+        archive_path: 压缩包路径
+        dest_dir:     解压目标目录（不存在会自动创建）
+
+    返回:
+        bool: 解压成功返回 True，否则返回 False
+    """
+    lower = archive_path.lower()
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        if lower.endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                for zinfo in zf.infolist():
+                    # 兼容 Windows 压缩工具生成的反斜杠路径分隔符：
+                    # zip 条目路径用 '\' 时 Linux 下会被当成单文件名，需规范化为 '/'
+                    fixed = zinfo.filename.replace("\\", "/")
+                    if fixed != zinfo.filename:
+                        zinfo.filename = fixed
+                    zf.extract(zinfo, dest_dir)
+        elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+            import tarfile
+            with tarfile.open(archive_path, "r:gz") as tf:
+                tf.extractall(dest_dir)
+        elif lower.endswith(".tar.bz2") or lower.endswith(".tbz2"):
+            import tarfile
+            with tarfile.open(archive_path, "r:bz2") as tf:
+                tf.extractall(dest_dir)
+        elif lower.endswith(".tar"):
+            import tarfile
+            with tarfile.open(archive_path, "r:") as tf:
+                tf.extractall(dest_dir)
+        else:
+            logging.warning("[插件下载] 不支持解压的压缩格式，跳过解压: %s", archive_path)
+            return False
+        logging.info("[插件下载] 解压成功: %s -> %s", archive_path, dest_dir)
+        return True
+    except Exception as e:
+        logging.error("[插件下载] 解压失败: %s -> %s: %s", archive_path, dest_dir, e)
+        return False
+
+
+def _strip_single_top_dir(dest_dir: str) -> None:
+    """
+    剥离解压目录中多余的单一顶层目录。
+
+    组件压缩包常见结构为顶层带一个与组件同名的目录（如 ruoyi/），
+    解压后为 dest_dir/ruoyi/{bin,app,config,...}。而 install/start/stop/
+    uninstall 等任务统一按 {component_dir}/{version}/bin/ 定位脚本，
+    因此需将顶层目录内容提升到 dest_dir 根。
+
+    仅当 dest_dir 下「恰好只有一个子目录、无其他顶层文件」时才剥离，避免误伤
+    本来就是扁平结构的压缩包。下载流程会预先在 dest_dir 根生成 application.yml
+    （组件描述文件），剥离时需将其排除，且不覆盖已存在的同名文件。
+
+    若唯一顶层目录名本身就是 bin（压缩包扁平结构，bin 已在最外层），则跳过剥离，
+    否则 bin 被提升掉后，install/start/stop 按 {version}/bin/ 定位脚本将失败。
+    """
+    try:
+        entries = os.listdir(dest_dir)
+    except OSError as e:
+        logging.warning("[插件下载] 检查顶层目录失败: %s: %s", dest_dir, e)
+        return
+    subdirs = [e for e in entries if os.path.isdir(os.path.join(dest_dir, e))]
+    # application.yml 为下载流程预生成的组件描述文件，不属于压缩包内容，排除
+    files = [
+        e for e in entries
+        if os.path.isfile(os.path.join(dest_dir, e)) and e != "application.yml"
+    ]
+    if len(subdirs) == 1 and not files:
+        top_dir = subdirs[0]
+        if top_dir.strip().lower() == "bin":
+            logging.info("[插件下载] 顶层目录为 bin，属扁平结构，跳过剥离: %s", dest_dir)
+            return
+        top_path = os.path.join(dest_dir, top_dir)
+        logging.info("[插件下载] 检测到压缩包单一顶层目录: %s, 剥离并提升内容到: %s",
+                     top_dir, dest_dir)
+        for name in os.listdir(top_path):
+            src = os.path.join(top_path, name)
+            dst = os.path.join(dest_dir, name)
+            if os.path.exists(dst):
+                logging.warning("[插件下载] 提升时跳过已存在的同名路径: %s", dst)
+                continue
+            try:
+                os.replace(src, dst)
+            except Exception as e:
+                logging.error("[插件下载] 提升文件失败 %s -> %s: %s", src, dst, e)
+        try:
+            os.rmdir(top_path)
+        except OSError:
+            pass
+
+
+# =============================================================================
+# 插件下载任务（主入口）
+# =============================================================================
+
+def plugin_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
+    """
+    插件下载任务 — 主入口。
+
+    与 download.py 的 download_task 结构完全对齐，路径多一层 plugin/。
+
+    处理流程: 参数校验 → 环境准备 → 文件下载 → 解压
+
+    必传参数:
+        task_id, download_url, file_suffix, file_name, version
+
+    version 必须由调用方显式传入：下载前 {file_name}/runtime/config.yaml 尚不存在，无法读取版本号。
+    save_path 从 config.yaml 的 server.download 读取。
+    """
+    # ── 1. 参数校验与提取 ──
+    error, params = _validate_and_extract_params(parameters)
+    if error:
+        return error
+
+    task_id = params['task_id']
+    save_path = params['save_path']
+    file_name = params['file_name']
+    file_suffix = params['file_suffix']
+    version = params.get('version', '')
+    sub_dir = str(parameters.get("sub_dir", "") or "plugin").strip()
+
+    # ── 2. 版本号：仅从参数取（下载前 runtime/config.yaml 尚不存在）──
+    if not version:
+        return _build_download_result(task_id, False,
+                                      "缺少版本号: 未传入 version 参数",
+                                      data={"file_name": file_name},
+                                      error_type="VersionMissing",
+                                      error_message="下载前无法读取 runtime/config.yaml，version 必须由参数显式传入")
+
+    # ── 3. 准备下载环境（目录、版本检查、application.yml）──
+    error, save_dir, version_dir = _prepare_download_environment(
+        task_id, save_path, file_name, version, sub_dir
+    )
+    if error:
+        # 合并服务数据到返回结果
+        error['data'] = {**error.get('data', {}), **_build_service_data(file_name, version)}
+        return error
+
+    # ── 4. 获取 Token（Linux 必需）──
+    token = ""
+    if _is_linux():
+        token = _login_app_store()
+        if not token:
+            file_name_with_suffix = file_name + file_suffix
+            target_file_path = os.path.join(version_dir, file_name_with_suffix)
+            logging.error("[插件下载] Linux系统获取token失败，无法下载")
+            return _build_download_result(task_id, False,
+                                          "获取token失败，Linux系统无法下载",
+                                          data={
+                                              "download_url": params['download_url'],
+                                              "save_path": save_path,
+                                              "file_name": file_name_with_suffix,
+                                              "file_path": target_file_path,
+                                              **_build_service_data(file_name, version)
+                                          },
+                                          error_type="TokenRequired",
+                                          error_message=f"Linux系统必须登录app_store获取token，请检查app_store配置(app_store.address={_APP_STORE_ADDRESS})"
+                                          )
+        logging.info("[插件下载] Linux系统，已获取token")
+    else:
+        logging.info("[插件下载] Windows系统，跳过token认证")
+
+    # ── 5. 拼接文件名并下载到版本目录 ──
+    if not file_suffix.startswith('.'):
+        file_suffix = '.' + file_suffix
+    file_name_with_suffix = file_name + file_suffix
+    target_file_path = os.path.join(version_dir, file_name_with_suffix)
+
+    logging.info(f"[插件下载] 下载文件: {params['download_url']} -> {target_file_path}"
+                 f", 重试: {retry}, 超时: {timeout}s")
+
+    result = _download_file(task_id, params['download_url'], target_file_path, retry, timeout, token)
+
+    # ── 6. 下载成功后解压到版本目录 ──
+    if result.get("result"):
+        extract_ok = _extract_archive(target_file_path, version_dir)
+        if extract_ok:
+            # 解压成功后删除压缩包
+            try:
+                os.remove(target_file_path)
+                logging.info("[插件下载] 已删除压缩包: %s", target_file_path)
+            except Exception as rm_err:
+                logging.warning("[插件下载] 删除压缩包失败: %s", rm_err)
+            # 剥离压缩包单一顶层目录（如 ruoyi/），使 install/start/stop 等按
+            # {plugin}/{file_name}/{version}/bin/ 定位生效
+            _strip_single_top_dir(version_dir)
+            result['data']["status"] = "downloaded_and_extracted"
+            result['data']["extracted_dir"] = version_dir
+        else:
+            result = _build_download_result(task_id, False,
+                                            f"解压失败: {target_file_path}",
+                                            data={
+                                                "download_url": params['download_url'],
+                                                "save_path": save_path,
+                                                "file_name": file_name_with_suffix,
+                                                "file_path": target_file_path,
+                                                "version_dir": version_dir,
+                                                **_build_service_data(file_name, version)
+                                            },
+                                            error_type="ExtractError",
+                                            error_message="下载成功但解压失败，请检查压缩包格式")
+            return result
+
+    # 合并通用数据和服务数据到返回结果
+    result['data'] = {
+        "download_url": params['download_url'],
+        "save_path": save_path,
+        "file_name": file_name_with_suffix,
+        **result.get('data', {}),
+        **_build_service_data(file_name, version)
+    }
+    return result
+
+
+if __name__ == "__main__":
+    import json
+
+    # ── 配置日志 ──
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    test_save_path = r"D:\bontor\tools" if _is_windows() else "/tmp/test_download"
+    test_file_name = "hellogitworld-master"
+    test_version = "1.0.0"
+
+    # ── 执行下载（version 必须显式传入，下载前不存在 runtime/config.yaml）──
+    result = plugin_download_task({
+        "task_id": "test-xkt-download-001",
+        "download_url": "https://github.com/githubtraining/hellogitworld/archive/refs/heads/master.zip",
+        "file_name": test_file_name,
+        "file_suffix": ".zip",
+        "version": test_version,
+    })
+
+    # ── 输出结果 ──
+    print("\n" + "=" * 60)
+    print("  插件下载任务结果")
+    print("=" * 60)
+    print(f"  状态: {'成功' if result['result'] else '失败'}")
+    print(f"  消息: {result['message']}")
+    if result.get("data"):
+        d = result["data"]
+        if d.get("status"):
+            print(f"  详情: {d['status']}")
+        if d.get("file_path"):
+            print(f"  文件: {d['file_path']}")
+    print("=" * 60)
+
+    # ── 打印生成的文件结构 ──
+    save_dir = os.path.join(test_save_path, "plugin", test_file_name)
+    if os.path.isdir(save_dir):
+        print("\n文件结构:")
+        for root, dirs, files in os.walk(save_dir):
+            level = root.replace(save_dir, "").count(os.sep)
+            indent = "  " * level
+            print(f"  {indent}{os.path.basename(root)}/")
+            sub_indent = "  " * (level + 1)
+            for f in files:
+                fpath = os.path.join(root, f)
+                size = os.path.getsize(fpath)
+                print(f"  {sub_indent}{f}  ({size} bytes)")
+
+    # ── 打印 application.yml 内容 ──
+    yml_path = os.path.join(save_dir, test_version, "application.yml")
+    if os.path.isfile(yml_path):
+        print(f"\n{yml_path}:")
+        print("-" * 60)
+        with open(yml_path, "r", encoding="utf-8") as yf:
+            print(yf.read(), end="")
+        print("-" * 60)
