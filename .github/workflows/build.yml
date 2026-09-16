@@ -1,0 +1,85 @@
+name: Build Agent (ARM64 + AMD64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_arch:
+        description: "Which arch to build"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - arm64
+          - amd64
+
+jobs:
+  build-arm64:
+    name: Build ARM64
+    if: ${{ github.event.inputs.build_arch == 'both' || github.event.inputs.build_arch == 'arm64' }}
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          uname -a
+          python3 --version
+          gcc --version | head -1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
+
+      - name: Build with Nuitka
+        run: |
+          chmod +x nuitka_linux_build.sh
+          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
+
+      - name: Verify output
+        run: |
+          ls -la linux_release/
+          tar -tzf linux_release/agent-linux.tar.gz | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-linux-arm64
+          path: linux_release/agent-linux.tar.gz
+          retention-days: 7
+
+  build-amd64:
+    name: Build AMD64
+    if: ${{ github.event.inputs.build_arch == 'both' || github.event.inputs.build_arch == 'amd64' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          uname -a
+          python3 --version
+          gcc --version | head -1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
+
+      - name: Build with Nuitka
+        run: |
+          chmod +x nuitka_linux_build.sh
+          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
+
+      - name: Verify output
+        run: |
+          ls -la linux_release/
+          tar -tzf linux_release/agent-linux.tar.gz | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-linux-amd64
+          path: linux_release/agent-linux.tar.gz
+          retention-days: 7
