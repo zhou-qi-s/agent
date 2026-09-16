@@ -1,0 +1,615 @@
+"""
+回滚服务任务模块
+
+基于统一目录结构，实现版本回滚的完整流程：
+停止当前版本 → 切换版本号 → 启动目标版本
+"""
+
+import logging
+import os
+import subprocess
+import time
+from typing import Any, Dict, List, Optional
+
+from utils.config_loader import load_config
+
+# ── 全局配置 ──
+_CONFIG = load_config()
+_DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+
+
+# =============================================================================
+# 结果构建
+# =============================================================================
+
+def _build_result(
+    task_id: str,
+    success: bool,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+    error_type: str = "",
+    error_message: str = "",
+    tb: str = "",
+) -> Dict[str, Any]:
+    return {
+        "success": success,
+        # 顶层状态码（平台约定）: 3=成功 / 13=回滚失败
+        "status": 3 if success else 13,
+        "task_id": task_id,
+        "task_type": "rollback",
+        "message": message,
+        "data": data or {},
+        "error": (
+            {}
+            if success
+            else {
+                "error_type": error_type or "RollbackTaskError",
+                "error_message": error_message or message,
+                "traceback": tb,
+            }
+        ),
+    }
+
+
+# =============================================================================
+# 进程与脚本工具
+# =============================================================================
+
+def _get_process_start_ticks(pid: int) -> Optional[int]:
+    """读取 /proc/{pid}/stat 中进程的 starttime 字段（自系统启动以来的时钟滴答数）。
+
+    用于后续校验时对比启动时间，防止 kill -9 后 PID 被回收复用导致误判"进程仍存活"。
+    返回 None 表示读取失败（进程已不存在或平台不支持）。
+    """
+    if os.name == "nt":
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read().strip()
+        # /proc/pid/stat 格式: "pid (comm) state ... starttime ..."
+        # starttime 是 comm 之后的第 21 个字段 (0-indexed: 20)
+        parts = stat.rsplit(")", 1)
+        if len(parts) != 2:
+            return None
+        fields = parts[1].split()
+        if len(fields) < 21:
+            return None
+        return int(fields[20])  # starttime, 单位为时钟滴答(通常 100Hz)
+    except (OSError, FileNotFoundError, ValueError):
+        return None
+
+
+def _is_zombie_or_dead(pid: int) -> bool:
+    """检查进程是否为僵尸态(Z)或已死亡(X)，读取 /proc/{pid}/stat 的 state 字段。
+
+    kill 后进程会短暂进入僵尸态，/proc/{pid} 仍存在、os.kill(pid,0) 仍成功，
+    但进程实际已终止。此场景下仅靠 os.kill 无法识别，必须检查进程状态。
+    """
+    if os.name == "nt":
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read().strip()
+        # 格式: "pid (comm) state ..."
+        parts = stat.rsplit(")", 1)
+        if len(parts) != 2:
+            return False
+        fields = parts[1].split()
+        if len(fields) == 0:
+            return False
+        state = fields[0]  # 第一个字段是进程状态
+        return state in ("Z", "z", "X", "x")
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> bool:
+    """检查进程是否真的存活（跨平台）。
+
+    与 stop.py 保持一致的多重校验，防止误判：
+    1. os.kill(pid, 0) 检查信号发送
+    2. 检查 /proc/{pid}/stat 状态字段，Z(僵尸)或X(已死亡)视为已停止
+    3. 对比 starttime，不一致说明 PID 已被回收复用（原进程已停止）
+    """
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True,
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            # 僵尸/已死亡进程视为已停止
+            if _is_zombie_or_dead(pid):
+                logging.info(
+                    "[rollback_task] PID %d 处于僵尸/死亡态，判定为已停止", pid
+                )
+                return False
+            # PID 回收 → starttime 已变化
+            if expected_start_ticks is not None:
+                current_start = _get_process_start_ticks(pid)
+                if current_start is not None and current_start != expected_start_ticks:
+                    logging.warning(
+                        "[rollback_task] PID %d 启动时间已变化 (之前=%s, 现在=%s)，"
+                        "该 PID 已被其他进程复用，原进程已停止",
+                        pid, expected_start_ticks, current_start,
+                    )
+                    return False
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, Any]:
+    """执行脚本，返回 {success, exit_code, stdout, stderr}"""
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(
+                [script_path],
+                cwd=bin_dir,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+        else:
+            proc = subprocess.run(
+                ["bash", script_path],
+                cwd=bin_dir,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "exit_code": -1, "stdout": "", "stderr": f"脚本执行超时 ({timeout}s)"}
+    except Exception as e:
+        return {"success": False, "exit_code": -1, "stdout": "", "stderr": f"脚本执行异常: {e}"}
+
+
+# =============================================================================
+# 路径解析
+# =============================================================================
+
+def _resolve_paths(service_name: str, target_version: str) -> tuple:
+    """
+    根据 service_name 解析组件路径，并校验目标版本目录是否存在。
+
+    返回:
+        (error, component_dir, current_version, target_version_dir, current_version_dir)
+        - 出错: (error_result, "", "", "", "")
+        - 正常: (None, component_dir, current_version, target_version_dir, current_version_dir)
+    """
+    if not _DOWNLOAD_BASE:
+        return (
+            _build_result(
+                "", False, "config.yaml 中未配置 server.download",
+                error_type="ConfigMissing",
+                error_message="server.download 未配置",
+            ),
+            "", "", "", "",
+        )
+
+    component_dir = os.path.join(_DOWNLOAD_BASE, service_name)
+    if not os.path.isdir(component_dir):
+        return (
+            _build_result(
+                "", False, f"组件目录不存在: {component_dir}",
+                error_type="FileNotFoundError",
+                error_message=f"组件目录不存在: {component_dir}",
+            ),
+            "", "", "", "",
+        )
+
+    # 读取当前 version
+    version_file = os.path.join(component_dir, "version")
+    current_version = ""
+    if os.path.isfile(version_file):
+        try:
+            with open(version_file, "r", encoding="utf-8") as vf:
+                current_version = vf.read().strip()
+        except Exception as e:
+            return (
+                _build_result("", False, f"读取 version 文件失败: {e}",
+                              error_type="VersionReadError", error_message=str(e)),
+                "", "", "", "",
+            )
+
+    # 校验目标版本目录是否存在
+    target_version_dir = os.path.join(component_dir, target_version)
+    if not os.path.isdir(target_version_dir):
+        return (
+            _build_result(
+                "", False, f"目标版本目录不存在: {target_version_dir}",
+                error_type="TargetVersionNotFound",
+                error_message=f"目标版本 {target_version} 的目录不存在，无法回滚",
+            ),
+            "", "", "", "",
+        )
+
+    # 当前版本目录（可能不存在，如首次安装）
+    current_version_dir = ""
+    if current_version:
+        current_version_dir = os.path.join(component_dir, current_version)
+
+    return None, component_dir, current_version, target_version_dir, current_version_dir
+
+
+# =============================================================================
+# 主入口
+# =============================================================================
+
+def rollback_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
+    """
+    回滚服务任务（停止当前版本 → 切换版本号 → 启动目标版本）。
+
+    参数:
+        - task_id:      任务ID（必填）
+        - service_name: 服务名称（必填），同时也是组件目录名
+        - version:      回滚目标版本号（必填）
+
+    流程:
+        1. 读取 {download}/{service_name}/version 获取当前版本
+        2. 若当前版本 == 目标版本 → 返回提示
+        3. 校验目标版本目录 {download}/{service_name}/app/{target_version}/ 是否存在
+        4. 停止当前版本:
+           a. 执行当前版本 bin/stop 脚本
+           b. 校验进程已销毁 → 删除 pid 文件
+        5. 更新 version 文件为目标版本号
+        6. 启动目标版本:
+           a. 执行目标版本 bin/start 脚本
+    """
+    task_id = str(parameters.get("task_id", "") or "").strip()
+    service_name = str(parameters.get("service_name", "") or "").strip()
+    target_version = str(parameters.get("version", "") or "").strip()
+
+    # ── 参数校验 ──
+    missing: List[str] = []
+    for key, val in [
+        ("task_id", task_id),
+        ("service_name", service_name),
+        ("version", target_version),
+    ]:
+        if not val:
+            missing.append(key)
+    if missing:
+        return _build_result(
+            task_id, False, f"参数缺失: {', '.join(missing)}",
+            error_type="ParameterMissing",
+            error_message=f"缺失参数: {', '.join(missing)}",
+        )
+
+    steps: List[Dict[str, Any]] = []
+
+    # ── 路径解析 ──
+    error, component_dir, current_version, target_version_dir, current_version_dir = \
+        _resolve_paths(service_name, target_version)
+    if error:
+        error["task_id"] = task_id
+        error["data"] = {
+            **(error.get("data") or {}),
+            "service_name": service_name,
+            "target_version": target_version,
+            "steps": steps,
+        }
+        return error
+
+    logging.info(
+        "[rollback_task] service=%s, current_version=%s, target_version=%s",
+        service_name, current_version or "(无)", target_version,
+    )
+
+    # ── 版本比对 ──
+    if current_version == target_version:
+        return _build_result(task_id, True, f"当前版本已是 {target_version}，无需回滚", data={
+            "service_name": service_name,
+            "version": target_version,
+            "status": "already_on_target",
+            "component_dir": component_dir,
+            "steps": steps,
+        })
+
+    # ── Step 1: 停止当前版本 ──
+    ext = ".bat" if os.name == "nt" else ".sh"
+
+    if current_version and os.path.isdir(current_version_dir):
+        old_runtime_dir = os.path.join(current_version_dir, "runtime")
+        old_pid_file = os.path.join(old_runtime_dir, "pid")
+        pid_list = []
+        pid_before = ""
+
+        if os.path.isfile(old_pid_file):
+            pid_list = []
+            try:
+                with open(old_pid_file, "r", encoding="utf-8") as pf:
+                    content = pf.read().strip()
+                logging.info("[rollback_task] 检测到 PID 文件内容: %s", content)
+                if content:
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            pid_list.append(int(line))
+                        except ValueError:
+                            pass
+            except Exception as e:
+                logging.warning("[rollback_task] 读取 PID 文件失败: %s", e)
+            pid_before = ",".join(str(p) for p in pid_list)
+
+            # 使用当前版本 bin/ 下的 stop 脚本
+            old_bin_dir = os.path.join(current_version_dir, "bin")
+            stop_script_path = os.path.join(old_bin_dir, f"stop{ext}")
+
+            if not os.path.isfile(stop_script_path):
+                return _build_result(
+                    task_id, False, f"当前版本停止脚本不存在: {stop_script_path}",
+                    data={
+                        "service_name": service_name,
+                        "current_version": current_version,
+                        "target_version": target_version,
+                        "steps": steps,
+                    },
+                    error_type="StopScriptNotFound",
+                    error_message=f"当前版本 {current_version} 的 bin 目录下无停止脚本，无法停止旧进程",
+                )
+
+            # 记录旧进程启动时间戳，用于 stop 后校验 PID 是否被回收复用
+            pid_start_ticks = None
+            if pid_list:
+                pid_start_ticks = _get_process_start_ticks(pid_list[0])
+                if pid_start_ticks is not None:
+                    logging.info("[rollback_task] 旧进程启动时间戳: %s", pid_start_ticks)
+
+            # 执行 stop 脚本
+            logging.info("[rollback_task] 执行停止脚本: %s", stop_script_path)
+            stop_exec = _execute_script(stop_script_path, old_bin_dir, min(timeout, 60))
+            logging.info(
+                "[rollback_task] 停止脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+                stop_exec["exit_code"], stop_exec.get("stdout", ""), stop_exec.get("stderr", ""),
+            )
+            steps.append({
+                "step": "stop_current",
+                "success": stop_exec["success"],
+                "message": "停止当前版本" + ("成功" if stop_exec["success"] else f"失败 (exit_code={stop_exec['exit_code']})"),
+                "data": {
+                    "pid_before": pid_before,
+                    "exit_code": stop_exec["exit_code"],
+                    "stdout": stop_exec.get("stdout", ""),
+                    "stderr": stop_exec.get("stderr", ""),
+                },
+            })
+
+            if not stop_exec["success"]:
+                return _build_result(
+                    task_id, False, f"停止当前版本失败 (exit_code={stop_exec['exit_code']})",
+                    data={
+                        "service_name": service_name,
+                        "current_version": current_version,
+                        "target_version": target_version,
+                        "steps": steps,
+                    },
+                    error_type="StopCurrentFailed",
+                    error_message=stop_exec.get("stderr", "") or f"脚本退出码: {stop_exec['exit_code']}",
+                )
+
+            # 校验进程是否已销毁（多 PID 逐一检查，带等待重试）
+            if pid_list:
+                still_alive = []
+                for pid_int in pid_list:
+                    exp_start = pid_start_ticks if pid_int == pid_list[0] else None
+                    alive = True
+                    for attempt in range(3):
+                        try:
+                            if not _process_exists(pid_int, exp_start):
+                                alive = False
+                                break
+                        except Exception:
+                            alive = False
+                            break
+                        # kill -9 后进程可能短暂处于退出中，等待后重试
+                        time.sleep(1)
+                    if alive:
+                        still_alive.append(str(pid_int))
+                if still_alive:
+                    return _build_result(
+                        task_id, False, f"进程 {', '.join(still_alive)} 仍然存活，停止失败",
+                        data={
+                            "service_name": service_name,
+                            "current_version": current_version,
+                            "target_version": target_version,
+                            "pid": pid_before,
+                            "process_still_alive": True,
+                            "steps": steps,
+                        },
+                        error_type="ProcessStillAlive",
+                        error_message=f"PID {', '.join(still_alive)} 进程仍然存活，无法继续回滚",
+                    )
+                else:
+                    logging.info("[rollback_task] 进程 %s 已销毁", pid_before)
+                    was_running = True
+            else:
+                logging.info("[rollback_task] PID 文件无有效 PID，跳过进程校验")
+
+            # 删除 PID 文件
+            if os.path.isfile(old_pid_file):
+                try:
+                    os.remove(old_pid_file)
+                    logging.info("[rollback_task] PID 文件已删除: %s", old_pid_file)
+                except Exception as e:
+                    logging.warning("[rollback_task] 删除 PID 文件失败: %s", e)
+        else:
+            logging.info("[rollback_task] 当前版本未运行，跳过停止步骤")
+            steps.append({
+                "step": "stop_current",
+                "success": True,
+                "message": "当前版本未运行，跳过停止",
+            })
+    else:
+        logging.info("[rollback_task] 无当前版本或目录不存在，跳过停止步骤")
+        steps.append({
+            "step": "stop_current",
+            "success": True,
+            "message": "无当前版本，跳过停止",
+        })
+
+    # ── Step 2: 更新 version 文件 ──
+    version_file = os.path.join(component_dir, "version")
+    try:
+        with open(version_file, "w", encoding="utf-8") as vf:
+            vf.write(target_version)
+        logging.info("[rollback_task] version 文件已更新为: %s", target_version)
+        steps.append({
+            "step": "update_version",
+            "success": True,
+            "message": f"version 文件已更新为 {target_version}(原: {current_version or '无'})",
+        })
+    except Exception as e:
+        return _build_result(
+            task_id, False, f"更新 version 文件失败: {e}",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "target_version": target_version,
+                "steps": steps,
+            },
+            error_type="VersionUpdateFailed",
+            error_message=f"写入 version 文件失败: {e}",
+        )
+
+    # ── Step 3: 启动目标版本 ──
+    target_bin_dir = os.path.join(target_version_dir, "bin")
+    target_start_script = os.path.join(target_bin_dir, f"start{ext}")
+
+    if not os.path.isfile(target_start_script):
+        return _build_result(
+            task_id, False, f"目标版本启动脚本不存在: {target_start_script}",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "target_version": target_version,
+                "steps": steps,
+            },
+            error_type="StartScriptNotFound",
+            error_message=f"目标版本 {target_version} 的 bin 目录下无启动脚本: {target_start_script}",
+        )
+
+    logging.info("[rollback_task] 使用目标版本启动脚本: %s", target_start_script)
+
+    # 执行 start 脚本
+    logging.info("[rollback_task] 执行目标版本启动脚本: %s", target_start_script)
+    start_exec = _execute_script(target_start_script, target_bin_dir, min(timeout, 60))
+    logging.info(
+        "[rollback_task] 启动脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+        start_exec["exit_code"], start_exec.get("stdout", ""), start_exec.get("stderr", ""),
+    )
+
+    if not start_exec["success"]:
+        # 启动失败，尝试恢复 version 文件
+        logging.error("[rollback_task] 目标版本启动失败，尝试恢复 version 文件")
+        try:
+            with open(version_file, "w", encoding="utf-8") as vf:
+                vf.write(current_version)
+            steps.append({
+                "step": "recover_version",
+                "success": True,
+                "message": f"启动失败，version 已恢复为 {current_version}",
+            })
+        except Exception as e:
+            logging.warning("[rollback_task] 恢复 version 文件失败: %s", e)
+            steps.append({
+                "step": "recover_version",
+                "success": False,
+                "message": f"恢复 version 失败: {e}",
+            })
+
+        return _build_result(
+            task_id, False, f"启动目标版本 {target_version} 失败 (exit_code={start_exec['exit_code']})",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "target_version": target_version,
+                "steps": steps,
+            },
+            error_type="StartTargetFailed",
+            error_message=start_exec.get("stderr", "") or f"脚本退出码: {start_exec['exit_code']}",
+        )
+
+    steps.append({
+        "step": "start_target",
+        "success": True,
+        "message": f"目标版本 {target_version} 启动成功",
+        "data": {
+            "exit_code": start_exec["exit_code"],
+            "stdout": start_exec.get("stdout", ""),
+        },
+    })
+
+    # ── 读取目标版本 PID ──
+    pid = ""
+    target_runtime_dir = os.path.join(target_version_dir, "runtime")
+    target_pid_file = os.path.join(target_runtime_dir, "pid")
+    if os.path.isfile(target_pid_file):
+        try:
+            with open(target_pid_file, "r", encoding="utf-8") as pf:
+                pid = pf.read().strip()
+            logging.info("[rollback_task] 目标版本主进程 PID: %s", pid)
+        except Exception as e:
+            logging.warning("[rollback_task] 读取目标版本 PID 失败: %s", e)
+
+    return _build_result(task_id, True, f"回滚完成: {current_version or '无'} → {target_version}", data={
+        "status": "rollback_done",
+        "service_name": service_name,
+        "old_version": current_version,
+        "current_version": target_version,
+        "component_dir": component_dir,
+        "pid": pid,
+        "steps": steps,
+    })
+
+
+# ── 自测入口 ──
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    result = rollback_task({
+        "task_id": "test-rollback-001",
+        "service_name": "hellogitworld-master",
+        "version": "1.0.0",
+    })
+
+    print("\n" + "=" * 60)
+    print("  回滚任务结果")
+    print("=" * 60)
+    print(f"  task_id : {result.get('task_id', '')}")
+    print(f"  成功    : {result['success']}")
+    print(f"  消息    : {result['message']}")
+    data = result.get("data", {})
+    if data:
+        for key in ("service_name", "old_version", "current_version", "status", "pid", "component_dir"):
+            print(f"  {key}: {data.get(key, 'N/A')}")
+    steps = data.get("steps", [])
+    if steps:
+        print("\n  步骤详情:")
+        for s in steps:
+            status = "OK" if s.get("success") else "FAIL"
+            print(f"  [{status}] {s.get('step')}: {s.get('message')}")
+    if not result["success"]:
+        err = result.get("error", {})
+        print(f"  错误类型: {err.get('error_type', '')}")
+        print(f"  错误信息: {err.get('error_message', '')}")
+    print("=" * 60)
