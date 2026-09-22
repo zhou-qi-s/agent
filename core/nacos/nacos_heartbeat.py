@@ -1,13 +1,18 @@
 """
 Nacos 心跳发送模块（本地进程版）
 
+【缓存区/运行区分离后的服务发现规则】
+
 定时向 Nacos 发送服务心跳，独立于 NacosRegister 工作：
-    1. 遍历 {download_base}/ 下所有子目录
-    2. 读取 version 文件 → 定位 app/{version}/runtime/
-    3. runtime/pid 存在且进程存活 → 读取 runtime/nacos 获取心跳参数
+    1. 遍历 {server.apps}/ 下所有服务目录
+    2. 读 state/config.yaml 判存活（runtime == true 且 pids 中有存活进程）
+    3. 读 {server.apps}/{服务名}/nacos/registered 获取注册时缓存的 Nacos 参数
     4. 并发调用 Nacos 心跳接口
 
 变更(v2)：ThreadPool 并发 + 指数退避重试 + token 认证 + Session 复用 + RateLimiter 限速。
+变更(v3)：改为扫运行区 state/config.yaml 判存活；
+          心跳参数缓存迁到 {apps}/{服务名}/nacos/registered
+          （原为 {download}/{服务名}/{版本}/runtime/nacos）。
 """
 
 import concurrent.futures
@@ -24,11 +29,20 @@ from core.nacos.k8s_nacos_common import (
     is_token_invalid,
     nacos_login,
 )
-from core.process.process_info import _process_exists
+from utils.app_path import (
+    SUB_DIR_CANDIDATES,
+    get_nacos_dir,
+    read_state,
+    read_state_pids,
+    filter_alive_pids,
+)
 from utils.config_loader import load_config
 
 _CONFIG = load_config()
-_DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 注册标记文件名（NacosRegister 写入，心跳读取复用）
+_REGISTERED_FILE = "registered"
 
 _LOG = "nacos_heartbeat"
 
@@ -47,94 +61,69 @@ _BEAT_JSON_CACHE: Dict[str, str] = {}
 
 
 class NacosHeartbeat:
-    """Nacos 心跳发送器：遍历目录发现存活进程，并发发送心跳（v2 升级版）"""
+    """Nacos 心跳发送器：扫运行区发现存活服务，并发发送心跳"""
 
     def __init__(self):
-        self._download_base = _DOWNLOAD_BASE
+        self._apps_base = _APPS_BASE
 
     # ------------------------------------------------------------------
-    # 服务发现（本地进程，文件系统方式，保持不变）
+    # 服务发现（扫运行区 + 读运行状态）
     # ------------------------------------------------------------------
 
     def _discover_for_heartbeat(self) -> List[Dict[str, Any]]:
-        """遍历 download 目录，发现需要发心跳的服务。"""
+        """
+        扫描运行区，发现需要发心跳的服务。
+
+        判据（三类应用都要覆盖，见 SUB_DIR_CANDIDATES）：
+            1. {apps}/[{sub_dir}/]{服务名}/state/config.yaml 的 runtime == true
+            2. pids 中至少一个进程存活
+            3. {apps}/[{sub_dir}/]{服务名}/nacos/registered 存在（说明已注册成功）
+
+        注意：显控台（displayConsole/）与插件（plugin/）应用多一层目录，
+        必须按类别层遍历，否则这两类应用的心跳永远发不出去（实例会被 Nacos 剔除）。
+        """
         result: List[Dict[str, Any]] = []
 
-        if not self._download_base or not os.path.isdir(self._download_base):
-            logging.warning("[%s] download 目录不存在: %s", _LOG, self._download_base)
+        if not self._apps_base or not os.path.isdir(self._apps_base):
+            logging.warning("[%s] 运行区目录不存在: %s", _LOG, self._apps_base)
             return result
 
-        for entry in os.listdir(self._download_base):
-            service_dir = os.path.join(self._download_base, entry)
-            if not os.path.isdir(service_dir):
+        for sub_dir in SUB_DIR_CANDIDATES:
+            root = os.path.join(self._apps_base, sub_dir) if sub_dir else self._apps_base
+            if not os.path.isdir(root):
                 continue
+            for entry in os.listdir(root):
+                service_dir = os.path.join(root, entry)
+                if os.path.islink(service_dir) or not os.path.isdir(service_dir):
+                    continue
 
-            version_file = os.path.join(service_dir, "version")
-            if not os.path.isfile(version_file):
-                continue
+                # 类别层目录本身没有 state/config.yaml，会在这里被自然跳过
+                state = read_state(entry, sub_dir)
+                if not state or not state.get("runtime"):
+                    continue
 
-            try:
-                with open(version_file, "r", encoding="utf-8") as vf:
-                    version = vf.read().strip()
-            except Exception as e:
-                logging.warning("[%s] 读取 version 失败: %s -> %s", _LOG, version_file, e)
-                continue
+                if not filter_alive_pids(read_state_pids(entry, sub_dir), entry):
+                    logging.info("[%s] 所有 PID 均已退出: service=%s/%s", _LOG, sub_dir, entry)
+                    continue
 
-            if not version:
-                continue
+                nacos_dir = get_nacos_dir(entry, sub_dir)
+                registered_file = os.path.join(nacos_dir, _REGISTERED_FILE) if nacos_dir else ""
+                if not registered_file or not os.path.isfile(registered_file):
+                    logging.debug("[%s] 尚未注册，跳过: service=%s/%s", _LOG, sub_dir, entry)
+                    continue
 
-            runtime_dir = os.path.join(service_dir, version, "runtime")
+                nacos_config = self._read_nacos_file(registered_file, entry)
+                if nacos_config is None:
+                    continue
 
-            pid_file = os.path.join(runtime_dir, "pid")
-            if not os.path.isfile(pid_file):
-                continue
-
-            if not self._check_process_alive(pid_file, entry):
-                continue
-
-            nacos_file = os.path.join(runtime_dir, "nacos")
-            if not os.path.isfile(nacos_file):
-                logging.debug("[%s] 无 nacos 文件，尚未注册，跳过: folder=%s", _LOG, entry)
-                continue
-
-            nacos_config = self._read_nacos_file(nacos_file, entry)
-            if nacos_config is None:
-                continue
-
-            result.append({
-                "folder_name": entry,
-                "version": version,
-                "nacos_config": nacos_config,
-            })
+                result.append({
+                    "folder_name": entry,
+                    "sub_dir": sub_dir,
+                    "version": str(state.get("version", "") or "").strip(),
+                    "nacos_config": nacos_config,
+                })
 
         return result
-
-    @staticmethod
-    def _check_process_alive(pid_file: str, folder_name: str) -> bool:
-        try:
-            with open(pid_file, "r", encoding="utf-8") as pf:
-                content = pf.read().strip()
-        except Exception as e:
-            logging.warning("[%s] 读取 pid 文件失败: %s -> %s", _LOG, pid_file, e)
-            return False
-
-        if not content:
-            return False
-
-        # 支持多行 PID，只要有一个存活就算 Alive
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                pid_int = int(line)
-            except ValueError:
-                continue
-            if _process_exists(pid_int):
-                return True
-
-        logging.info("[%s] 所有 PID 均已退出: folder=%s", _LOG, folder_name)
-        return False
 
     @staticmethod
     def _read_nacos_file(nacos_file: str, folder_name: str) -> Optional[Dict[str, Any]]:

@@ -13,21 +13,22 @@ server:
         max_connections: 8 # 连接池最大连接数
         socket_timeout: 15 # 读写超时，需大于任务阻塞读取超时时间
         socket_connect_timeout: 10 #连接超时
-  download: /var/cache/agent/download #默认下载地址
+  download: /var/cache/agent/download #默认下载地址（缓存区：仅存放应用包解压后的原始内容，可清理）
+  apps: /var/cache/agent/apps #运行区：需部署的版本由 install 复制到此，app/ 目录以软链接指向缓存区
   network_interface: "wlp0s20f3" # 指定网卡名称（如 eth0、以太网），留空则自动检测
   # FastAPI 配置
   fastapi:
-    host: 0.0.0.0 # listen all interfaces
+    host: 192.168.0.3 # 监听所有网络接口
     port: 8000 # FastAPI 端口
     workers: 1   # 工作进程数
 harbor:
-  agreement: https://
+  agreement: http://
   username: admin
   password: 12345
   download: /var/cache/agent/tools #镜像临时存放地址
   project: tools
   template: helm
-  port: 443
+  port: 30008
 helm:
   config: /etc/kubernetes/admin.conf
   index_key: helm:release:index       # ZSET 索引
@@ -35,7 +36,6 @@ helm:
 interface:
   register: /api/agent/register #注册
   task_report: /api/agent/task_report #任务结果上报
-  xkt_report: /api/agent/xkt_report #xkt进程监控上报
   alarm: /api/agent/alarm #告警上报
   # nacos注册接口
   registerUrl: /api/component/register
@@ -88,7 +88,7 @@ k8s:
 
 app_store:
   # 注意: 地址必须是 Agent 可访问的 app_store 登录接口，登录成功返回 {"code":0,"token":"..."}
-  address: http://192.168.0.5:8099/appStore/admin/login
+  address: http://192.168.0.4:8099/appStore/admin/login
   username: admin
   password: admin
 

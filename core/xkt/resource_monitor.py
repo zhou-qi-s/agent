@@ -1,11 +1,16 @@
 """
 显控进程资源监控模块
 
-定时遍历 download/displayConsole/{服务名}/{版本}/runtime/pid 读取显控台 PID，
-查询进程资源使用情况（CPU/内存/IO），
-将采集数据写入 download/xkt/resources/{进程名}。
+【缓存区/运行区分离后的采集规则】
 
-PID 唯一落点：{版本}/runtime/pid（由 core/xkt/process_check.py 巡检维护）。
+定时扫描「运行区」显控台/插件服务，读取运行状态中的 PID，
+查询进程资源使用情况（CPU/内存/IO），将采集数据写入
+{server.apps}/{服务}/runtime/resources.txt。
+
+    1. 遍历 {apps}/displayConsole/ 与 {apps}/plugin/ 下各服务
+    2. 读 state/config.yaml 的 pids（不读已废弃的 {版本}/runtime/pid）
+    3. 按进程名聚合（processes 字段，取第一个；缺省用服务名）
+
 资源采集逻辑参考 core/alarm/alarm.py 中的 check_process_resource。
 """
 
@@ -20,7 +25,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 import yaml
 
-from utils.config_loader import load_config
+from utils.app_path import (
+    SUB_DIR_PLUGIN,
+    SUB_DIR_XKT,
+    read_state,
+    read_state_pids,
+)
+from utils.config_loader import get_apps_dir, load_config
 
 
 # =============================================================================
@@ -35,110 +46,71 @@ _io_baseline: Dict[int, Dict[str, float]] = {}
 # 工具函数
 # =============================================================================
 
-def _get_download_path() -> str:
-    """获取 download 目录的绝对路径"""
+def _get_apps_path() -> str:
+    """获取运行区（server.apps）目录的绝对路径"""
+    apps = get_apps_dir()
+    if apps:
+        return apps
     cfg = load_config()
-    download = cfg.get("server", {}).get("download", "download")
-    if not os.path.isabs(download):
-        download = os.path.join(
+    fallback = cfg.get("server", {}).get("apps", "apps")
+    if not os.path.isabs(fallback):
+        fallback = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            download
+            fallback
         )
-    return download
+    return fallback
 
 
-def _read_xkt_pids(display_console_dir: str) -> Dict[str, List[int]]:
+def _read_xkt_pids(services_root: str, sub_dir: str = "") -> Dict[str, List[int]]:
     """
-    读取显控台各服务的 PID。
+    读取指定类别下各服务的 PID（**扫运行区**）。
 
     目录结构:
-        download/displayConsole/
+        {apps}/[{sub_dir}/]
             {服务名}/
-                version                    ← 当前版本号
-                {版本}/
-                    runtime/
-                        config.yaml        ← name 字段 = 进程名（用于聚合命名）
-                        pid                ← 文件内容 = PID（一行一个）
+                state/config.yaml      ← 运行状态（pids / processes）
 
-    进程名取 runtime/config.yaml 的 name 字段（取第一个），
-    取不到时退化为服务目录名。
+    进程名取 state 的 processes 字段（取第一个），取不到时退化为服务目录名。
 
     参数:
-        display_console_dir: download/displayConsole 目录路径
+        services_root: 类别根目录，如 {apps}/displayConsole 或 {apps}/plugin
+        sub_dir:       类别子目录（用于读状态；留空则不区分）
 
     返回:
         {进程名: [PID列表]}
     """
     result: Dict[str, List[int]] = {}
 
-    if not os.path.isdir(display_console_dir):
+    if not os.path.isdir(services_root):
         return result
 
-    for service_name in os.listdir(display_console_dir):
-        service_dir = os.path.join(display_console_dir, service_name)
-        if not os.path.isdir(service_dir):
+    for service_name in os.listdir(services_root):
+        service_dir = os.path.join(services_root, service_name)
+        # 跳过软链接（current/app/bin/config）与普通文件
+        if os.path.islink(service_dir) or not os.path.isdir(service_dir):
             continue
 
-        # ── 读取 version 文件 ──
-        version_file = os.path.join(service_dir, "version")
-        if not os.path.isfile(version_file):
-            continue
-        try:
-            with open(version_file, "r", encoding="utf-8") as vf:
-                version = vf.read().strip()
-        except Exception as e:
-            logging.warning("[xkt资源监控] 读取 version 失败: %s -> %s", version_file, e)
-            continue
-        if not version:
+        state = read_state(service_name, sub_dir)
+        if not state or not state.get("runtime"):
             continue
 
-        version_dir = os.path.join(service_dir, version)
-
-        # ── 读取 runtime/pid ──
-        pid_file = os.path.join(version_dir, "runtime", "pid")
-        if not os.path.isfile(pid_file):
-            continue
-        try:
-            with open(pid_file, "r", encoding="utf-8") as f:
-                pid_lines = f.read().strip().splitlines()
-        except Exception as e:
-            logging.warning("[xkt资源监控] 读取 PID 文件失败: %s -> %s", pid_file, e)
-            continue
-
-        pids = [int(line.strip()) for line in pid_lines if line.strip().isdigit()]
+        pids = read_state_pids(service_name, sub_dir)
         if not pids:
             continue
 
-        result[_read_process_name(version_dir, service_name)] = pids
+        names = state.get("processes") or []
+        if isinstance(names, str):
+            names = [names]
+        pname = names[0] if names else service_name
+
+        result[pname] = pids
 
     return result
 
 
-def _read_process_name(version_dir: str, fallback: str) -> str:
-    """
-    从 {version_dir}/runtime/config.yaml 读取进程名（name 字段，取第一个）。
-
-    参数:
-        version_dir: 版本目录
-        fallback:    读不到时的兜底名称（通常为服务目录名）
-
-    返回:
-        进程名
-    """
-    config_path = os.path.join(version_dir, "runtime", "config.yaml")
-    if not os.path.isfile(config_path):
-        return fallback
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        names = config.get("name", [])
-        if isinstance(names, str):
-            names = [names]
-        if names:
-            return str(names[0])
-    except Exception as e:
-        logging.warning("[xkt资源监控] 读取 config.yaml 失败: %s -> %s", config_path, e)
-    return fallback
+# 注：原 _read_process_name() 已删除。
+#     进程名现直接从运行状态 state/config.yaml 的 processes 字段读取
+#     （见 _read_xkt_pids），不再读 {版本}/runtime/config.yaml。
 
 
 # =============================================================================
@@ -250,12 +222,12 @@ def _collect_one_pid(
 
 def collect_xkt_resources(max_workers: int = 8) -> Dict[str, Any]:
     """
-    读取 displayConsole 各服务的 runtime/pid → 多线程并行查询资源 → 写入 resources 目录。
+    读取运行区显控台/插件服务的 state pids → 多线程并行查询资源 → 写入各服务 runtime/。
 
     流程:
-        1. 遍历 download/displayConsole/{服务名}/{版本}/runtime/pid
+        1. 遍历 {apps}/displayConsole/ 与 {apps}/plugin/ 下各服务，读 state/config.yaml 的 pids
         2. 使用线程池并行采集每个 PID 的 CPU/内存/IO
-        3. 按进程名聚合结果，写入 download/xkt/resources/{进程名}
+        3. 按进程名聚合结果，写入 {apps}/[{sub_dir}/]{服务}/runtime/resources.txt
 
     参数:
         max_workers: 线程池最大线程数，默认 8
@@ -268,19 +240,37 @@ def collect_xkt_resources(max_workers: int = 8) -> Dict[str, Any]:
             "details": [...]
         }
     """
-    download_path = _get_download_path()
-    display_console_dir = os.path.join(download_path, "displayConsole")
-    resources_dir = os.path.join(download_path, "xkt", "resources")
+    apps_path = _get_apps_path()
 
-    try:
-        Path(resources_dir).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logging.error("[xkt资源监控] 创建 resources 目录失败: %s", e)
-        return {"success": False, "collected": 0, "failed": 0, "details": [], "error": str(e)}
+    # 收集两类服务：{进程名: (pids, 服务目录, 子类别)}
+    pid_map: Dict[str, List[int]] = {}
+    service_roots: List[Tuple[str, str]] = []   # (服务目录, sub_dir)
+    for sub_dir in (SUB_DIR_XKT, SUB_DIR_PLUGIN):
+        root = os.path.join(apps_path, sub_dir)
+        if not os.path.isdir(root):
+            continue
+        for service_name in os.listdir(root):
+            service_dir = os.path.join(root, service_name)
+            if os.path.islink(service_dir) or not os.path.isdir(service_dir):
+                continue
+            service_roots.append((service_dir, sub_dir))
 
-    pid_map = _read_xkt_pids(display_console_dir)
+    for service_dir, sub_dir in service_roots:
+        service_name = os.path.basename(os.path.normpath(service_dir))
+        state = read_state(service_name, sub_dir)
+        if not state or not state.get("runtime"):
+            continue
+        pids = read_state_pids(service_name, sub_dir)
+        if not pids:
+            continue
+        names = state.get("processes") or []
+        if isinstance(names, str):
+            names = [names]
+        pname = names[0] if names else service_name
+        pid_map[pname] = pids
+
     if not pid_map:
-        logging.debug("[xkt资源监控] displayConsole 下没有可采集的 PID")
+        logging.debug("[xkt资源监控] 运行区下没有可采集的 PID")
         return {"success": True, "collected": 0, "failed": 0, "details": []}
 
     # 收集所有 (pid, process_name) 任务
@@ -333,7 +323,7 @@ def collect_xkt_resources(max_workers: int = 8) -> Dict[str, Any]:
         elapsed, len(pid_tasks), actual_workers, collected, failed
     )
 
-    # 写入文件
+    # 写入各服务的 runtime/resources.txt（落在运行区）
     details: List[Dict[str, Any]] = []
     for process_name, resources in process_resources.items():
         output_data = {
@@ -341,7 +331,31 @@ def collect_xkt_resources(max_workers: int = 8) -> Dict[str, Any]:
             "timestamp": int(time.time()),
             "resources": resources,
         }
-        output_file = os.path.join(resources_dir, process_name)
+
+        # 找到该进程名对应的服务目录，写入其 runtime/
+        target_dir = None
+        for service_dir, sub_dir in service_roots:
+            sname = os.path.basename(os.path.normpath(service_dir))
+            st = read_state(sname, sub_dir)
+            names = st.get("processes") or []
+            if isinstance(names, str):
+                names = [names]
+            if (names[0] if names else sname) == process_name:
+                target_dir = service_dir
+                break
+
+        if not target_dir:
+            logging.warning("[xkt资源监控] 未找到进程名 %s 对应的服务，跳过写文件", process_name)
+            continue
+
+        runtime_dir = os.path.join(target_dir, "runtime")
+        try:
+            Path(runtime_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logging.error("[xkt资源监控] 创建 runtime 目录失败: %s -> %s", runtime_dir, e)
+            continue
+
+        output_file = os.path.join(runtime_dir, "resources.txt")
         try:
             temp_file = output_file + ".tmp"
             with open(temp_file, "w", encoding="utf-8") as f:

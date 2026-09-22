@@ -1,8 +1,26 @@
 """
 进程信息采集模块
 
-遍历 download 目录下所有组件，读取 version → {version}/runtime/pid，
-根据 PID 查询进程详情并返回。
+【缓存区 / 运行区分离后的采集规则】
+
+以「运行区」为采集依据，逐个服务执行：
+    1. 读 {server.apps}/{服务名}/state/config.yaml
+    2. 判断 runtime 字段：
+         runtime != true  → 服务未运行，跳过
+         runtime == true  → 继续
+    3. 读取其中的 pid 字段（**支持多个 pid**，换行分隔）
+    4. 过滤出仍存活的 pid：
+         全部已死 → 把状态里的 pid 清空、runtime 置 false
+         部分存活 → 把状态里的 pid 更新为存活列表
+    5. 对存活 pid 采集进程详情（含子进程）
+    6. 支持多进程服务：每个存活 pid 各采一条，各自展开子进程
+
+运行区结构：
+    {server.apps}/{服务名}/
+        ├── state/config.yaml     运行状态（pid / name / runtime / version）
+        ├── current -> {download}/{服务名}/{版本}
+        ├── app/bin/config -> current/xxx
+        └── runtime/              采集结果 resources.txt 落点
 """
 
 import json
@@ -17,15 +35,24 @@ from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
 from utils.config_loader import load_config
+from utils.app_path import (
+    find_apps_component_dir,
+    read_state,
+    read_state_pids,
+    filter_alive_pids,
+    refresh_state_pids,
+    get_process_names,
+)
 from utils.util import get_ip
 
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
 
-# 显控台服务的一级目录名：{download}/displayConsole/{服务名}/{版本}
+# 显控台服务的一级目录名：{apps}/displayConsole/{服务名}
 _XKT_SERVICE_ROOT = "displayConsole"
 
-# 插件应用的一级目录名：{download}/plugin/{服务名}/{版本}
+# 插件应用的一级目录名：{apps}/plugin/{服务名}
 _PLUGIN_SERVICE_ROOT = "plugin"
 
 
@@ -125,60 +152,55 @@ def _build_process_entry(pid: int, service_name: str, version: str,
 
 
 def _collect_service_processes(
-        service_dir: str, entry: str, timestamp: int
+        service_dir: str, entry: str, timestamp: int, sub_dir: str = ""
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     采集单个服务的进程信息（供线程池并行调用）。
 
+    采集依据：运行区 {apps}[/{sub_dir}]/{服务名}/state/config.yaml
+        - runtime 必须为 true，否则视为未运行
+        - pid 字段支持多个 pid（换行分隔）
+        - 死 pid 会被过滤，并顺带回写状态文件
+
     参数:
-        service_dir: 服务目录路径
-        entry:      服务名称（目录名）
-        timestamp:  采集时间戳
+        service_dir: 运行区服务目录路径 {apps}[/{sub_dir}]/{entry}
+        entry:       服务名称（目录名）
+        timestamp:   采集时间戳
+        sub_dir:     应用类别层（"" / displayConsole / plugin）——
+                     读状态文件时必须带上，否则显控台/插件服务会读不到 pids（历史缺陷）
 
     返回:
         (entry, [进程条目列表])
     """
     processes: List[Dict[str, Any]] = []
 
-    version_file = os.path.join(service_dir, "version")
-    if not os.path.isfile(version_file):
+    # ── 读运行状态 ──
+    state = read_state(entry, sub_dir)
+    if not state:
         return (entry, processes)
 
-    try:
-        with open(version_file, "r", encoding="utf-8") as vf:
-            version = vf.read().strip()
-    except Exception as e:
-        logging.warning("[collect_service] 读取 version 失败: %s -> %s", version_file, e)
+    if not state.get("runtime"):
         return (entry, processes)
 
-    if not version:
+    version = str(state.get("version", "") or "").strip()
+
+    # ── 取 pids 数组并过滤存活 ──
+    pid_list = read_state_pids(entry, sub_dir)
+    if not pid_list:
         return (entry, processes)
 
-    pid_file = os.path.join(service_dir, version, "runtime", "pid")
-    if not os.path.isfile(pid_file):
+    alive_pids = filter_alive_pids(pid_list, entry)
+
+    # 死 pid 清理：全部死 → 清空 + runtime=false；部分死 → 只留存活的
+    if len(alive_pids) != len(pid_list):
+        refresh_state_pids(entry, alive_pids, get_process_names(alive_pids), sub_dir)
+
+    if not alive_pids:
         return (entry, processes)
 
-    try:
-        with open(pid_file, "r", encoding="utf-8") as pf:
-            pid_str = pf.read().strip()
-    except Exception:
-        return (entry, processes)
-
-    if not pid_str:
-        return (entry, processes)
-
+    # ── 逐个 pid 采集（含子进程）──
     seen: set = set()
-    for line in pid_str.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pid_int = int(line)
-        except ValueError:
-            continue
-        if pid_int in seen:
-            continue
-        seen.add(pid_int)
+    for pid_int in alive_pids:
 
         # 采集父进程
         processes.append(_build_process_entry(pid_int, entry, version, timestamp))
@@ -192,30 +214,35 @@ def _collect_service_processes(
     return (entry, processes)
 
 
-def _iter_service_dirs() -> List[Tuple[str, str]]:
+def _iter_service_dirs() -> List[Tuple[str, str, str]]:
     """
-    收集所有需要采集的服务目录。
+    收集所有需要采集的服务目录（**扫描运行区**）。
 
     支持三种目录结构：
-        {download}/{服务名}/version                    ← 虚拟机 / 通用服务
-        {download}/displayConsole/{服务名}/version     ← 显控台服务
-        {download}/plugin/{服务名}/version             ← 插件服务
+        {apps}/{服务名}/state/config.yaml                    ← 虚拟机 / 通用服务
+        {apps}/displayConsole/{服务名}/state/config.yaml     ← 显控台服务
+        {apps}/plugin/{服务名}/state/config.yaml             ← 插件服务
+
+    有效服务判据：目录下存在 state/config.yaml（install 阶段写入）。
+    仅 runtime=true 的会在采集时被真正处理，此处只做目录筛选。
 
     返回:
-        [(service_dir, service_name), ...]
+        [(service_dir, service_name, sub_dir), ...]
+        —— sub_dir 是应用类别层（"" / displayConsole / plugin），
+           调用方读取状态文件时必须一并传入，否则会按「一楼」去找而读不到。
     """
-    tasks: List[Tuple[str, str]] = []
+    tasks: List[Tuple[str, str, str]] = []
 
-    if not _DOWNLOAD_BASE or not os.path.isdir(_DOWNLOAD_BASE):
+    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
         return tasks
 
-    scan_roots: List[str] = [_DOWNLOAD_BASE]
+    scan_roots: List[Tuple[str, str]] = [(_APPS_BASE, "")]
     for sub_root in (_XKT_SERVICE_ROOT, _PLUGIN_SERVICE_ROOT):
-        root = os.path.join(_DOWNLOAD_BASE, sub_root)
+        root = os.path.join(_APPS_BASE, sub_root)
         if os.path.isdir(root):
-            scan_roots.append(root)
+            scan_roots.append((root, sub_root))
 
-    for root in scan_roots:
+    for root, sub_dir in scan_roots:
         try:
             entries = os.listdir(root)
         except Exception as e:
@@ -224,12 +251,14 @@ def _iter_service_dirs() -> List[Tuple[str, str]]:
 
         for entry in entries:
             service_dir = os.path.join(root, entry)
-            if not os.path.isdir(service_dir):
+            # 跳过软链接（运行区内的 current/app/bin/config 是链接，不是服务目录）
+            if os.path.islink(service_dir) or not os.path.isdir(service_dir):
                 continue
-            # 只有带 version 文件的目录才算有效服务
-            if not os.path.isfile(os.path.join(service_dir, "version")):
+            # 有效服务判据：存在 state/config.yaml
+            state_file = os.path.join(service_dir, "state", "config.yaml")
+            if not os.path.isfile(state_file):
                 continue
-            tasks.append((service_dir, entry))
+            tasks.append((service_dir, entry, sub_dir))
 
     return tasks
 
@@ -263,12 +292,12 @@ def collect_all_processes(max_workers: int = 8) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     timestamp = int(datetime.now().timestamp() * 1000)
 
-    if not _DOWNLOAD_BASE or not os.path.isdir(_DOWNLOAD_BASE):
-        logging.warning("[collect_all_processes] download 目录不存在: %s", _DOWNLOAD_BASE)
+    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
+        logging.warning("[collect_all_processes] 运行区目录不存在: %s", _APPS_BASE)
         return result
 
-    # Step 1: 收集所有待采集的服务目录（含显控台 displayConsole 下的服务）
-    service_tasks: List[Tuple[str, str]] = _iter_service_dirs()  # [(service_dir, entry), ...]
+    # Step 1: 收集所有待采集的服务目录（扫运行区，含显控台 displayConsole 下的服务）
+    service_tasks: List[Tuple[str, str, str]] = _iter_service_dirs()  # [(service_dir, entry, sub_dir), ...]
 
     if not service_tasks:
         return result
@@ -284,8 +313,8 @@ def collect_all_processes(max_workers: int = 8) -> List[Dict[str, Any]]:
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = {
-            executor.submit(_collect_service_processes, sd, en, timestamp): en
-            for sd, en in service_tasks
+            executor.submit(_collect_service_processes, sd, en, timestamp, sdir): en
+            for sd, en, sdir in service_tasks
         }
         for future in as_completed(futures):
             service_name = futures[future]
@@ -426,50 +455,31 @@ def sync_redis_to_resources(expire: int = 600) -> Dict[str, Any]:
         logging.error("[sync_redis_to_resources] Redis 连接失败: %s", e)
         return {"success": False, "synced": 0, "failed": 0, "error": str(e)}
 
-    if not _DOWNLOAD_BASE or not os.path.isdir(_DOWNLOAD_BASE):
-        logging.warning("[sync_redis_to_resources] download 目录不存在: %s", _DOWNLOAD_BASE)
-        return {"success": False, "synced": 0, "failed": 0, "error": "download 目录不存在"}
+    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
+        logging.warning("[sync_redis_to_resources] 运行区目录不存在: %s", _APPS_BASE)
+        return {"success": False, "synced": 0, "failed": 0, "error": "运行区目录不存在"}
 
-    # 收集所有服务 → 版本 → PID 的映射（含显控台 displayConsole 下的服务）
+    # 收集所有服务 → 版本 → PID 的映射（扫运行区，含显控台 displayConsole 下的服务）
     # service_map: {service_dir: {"service_name": "xxx", "version": "1.0.0", "pids": [123, 456]}}
     service_map: Dict[str, Dict[str, Any]] = {}
 
-    for service_dir, entry in _iter_service_dirs():
-        version_file = os.path.join(service_dir, "version")
-
-        try:
-            with open(version_file, "r", encoding="utf-8") as vf:
-                version = vf.read().strip()
-        except Exception:
+    for service_dir, entry, sub_dir in _iter_service_dirs():
+        # 读运行状态：runtime 必须为 true
+        # 注意带 sub_dir：显控台/插件服务在运行区多一层，少了它读不到状态
+        state = read_state(entry, sub_dir)
+        if not state or not state.get("runtime"):
             continue
 
-        if not version:
+        version = str(state.get("version", "") or "").strip()
+
+        # 取 pids 数组，过滤存活
+        alive = filter_alive_pids(read_state_pids(entry, sub_dir), entry)
+        if not alive:
             continue
 
-        pid_file = os.path.join(service_dir, version, "runtime", "pid")
-        if not os.path.isfile(pid_file):
-            continue
-
-        try:
-            with open(pid_file, "r", encoding="utf-8") as pf:
-                pid_str = pf.read().strip()
-        except Exception:
-            continue
-
-        if not pid_str:
-            continue
-
-        # 支持多行 PID
         pids = []
         seen = set()
-        for line in pid_str.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                pid_int = int(line)
-            except ValueError:
-                continue
+        for pid_int in alive:
             if pid_int not in seen:
                 seen.add(pid_int)
                 pids.append(pid_int)
@@ -512,17 +522,10 @@ def sync_redis_to_resources(expire: int = 600) -> Dict[str, Any]:
 
         grouped[service_dir_key] = service_processes
 
-    # 写入各服务的 resources.txt
+    # 写入各服务的 resources.txt（落在运行区 {apps}/{服务名}/runtime/）
     for service_dir_key, process_list in grouped.items():
-        info = service_map.get(service_dir_key, {})
-        version = info.get("version", "")
-        service_name = info.get("service_name", service_dir_key)
-        if not version:
-            failed += 1
-            errors.append(f"{service_name}: 缺少版本号")
-            continue
-
-        runtime_dir = os.path.join(service_dir_key, version, "runtime")
+        # 落点直接由运行区组件目录推导，不再依赖版本号
+        runtime_dir = os.path.join(service_dir_key, "runtime")
         os.makedirs(runtime_dir, exist_ok=True)
         resources_file = os.path.join(runtime_dir, "resources.txt")
 

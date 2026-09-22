@@ -12,10 +12,26 @@ import traceback
 from typing import Any, Dict, List, Optional
 
 from utils.config_loader import load_config
+from utils.app_path import (
+    find_cache_version_dir,
+    find_apps_component_dir,
+    list_cache_versions,
+    get_pid_file,
+    read_pid,
+    read_pids_from_file,
+    read_state,
+    write_state,
+    wait_process_alive,
+    get_process_names,
+)
 
 # ── 全局配置 ──
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 启动后等待确认进程存活的秒数（避免"秒退"被误判为启动成功）
+START_CONFIRM_WAIT = 60
 
 
 # =============================================================================
@@ -50,14 +66,21 @@ def _build_result(
     }
 
 
-def _resolve_paths(service_name: str) -> tuple:
+def _resolve_paths(service_name: str, version: str) -> tuple:
     """
-    根据 service_name 解析组件路径。
+    根据 service_name + version 解析启动所需的路径。
+
+    定位规则（缓存区 / 运行区分离后）：
+        1. 校验缓存区中存在该版本      {server.download}/{service_name}/{version}/
+           —— 不存在则拒绝启动（说明还没下载或版本不对）
+        2. 在运行区定位组件目录        {server.apps}/{service_name}/
+           —— 由 install 阶段建立软链接结构，
+              bin/ 经 current/bin 指向缓存区，脚本从运行区执行
 
     返回:
         (error, component_dir, version, bin_dir)
         - 出错: (error_result, "", "", "")
-        - 正常: (None, component_dir, version, bin_dir)
+        - 正常: (None, 运行区组件目录, version, 运行区 bin 目录)
     """
     if not _DOWNLOAD_BASE:
         return (
@@ -69,47 +92,52 @@ def _resolve_paths(service_name: str) -> tuple:
             "", "", "",
         )
 
-    component_dir = os.path.join(_DOWNLOAD_BASE, service_name)
-    if not os.path.isdir(component_dir):
+    # ── 1. 校验缓存区版本目录存在 ──
+    cache_version_dir = find_cache_version_dir(service_name, version)
+    if not cache_version_dir:
+        available = list_cache_versions(service_name)
+        expected = os.path.join(_DOWNLOAD_BASE, service_name, version)
         return (
             _build_result(
-                "", False, f"组件目录不存在: {component_dir}",
-                error_type="FileNotFoundError",
-                error_message=f"组件目录不存在: {component_dir}",
+                "", False, f"缓存区中不存在版本 {version}: {expected}",
+                data={"service_name": service_name, "version": version,
+                      "expected": expected, "available_versions": available},
+                error_type="VersionDirNotFound",
+                error_message=(f"缓存区中未找到版本 {version}，"
+                               f"已下载的版本: {available or '无'}"),
             ),
             "", "", "",
         )
 
-    # 读取 version
-    version_file = os.path.join(component_dir, "version")
-    if not os.path.isfile(version_file):
+    # ── 2. 在运行区定位组件目录 ──
+    if not _APPS_BASE:
         return (
             _build_result(
-                "", False, f"version 文件不存在: {version_file}",
-                error_type="FileNotFoundError",
-                error_message="未找到 version 文件，请确认组件已下载",
+                "", False, "config.yaml 中未配置 server.apps 运行区路径",
+                error_type="ConfigMissing",
+                error_message="server.apps 未配置，无法定位运行区组件",
             ),
             "", "", "",
         )
-    try:
-        with open(version_file, "r", encoding="utf-8") as vf:
-            version = vf.read().strip()
-    except Exception as e:
+
+    component_dir = find_apps_component_dir(service_name)
+    if not component_dir:
+        expected_apps = os.path.join(_APPS_BASE, service_name)
         return (
-            _build_result("", False, f"读取 version 失败: {e}",
-                          error_type="VersionReadError", error_message=str(e)),
-            "", "", "",
-        )
-    if not version:
-        return (
-            _build_result("", False, "version 文件为空",
-                          error_type="VersionEmpty", error_message="version 文件为空"),
+            _build_result(
+                "", False, f"运行区组件不存在: {expected_apps}，请先执行安装",
+                data={"service_name": service_name, "version": version,
+                      "apps_dir": _APPS_BASE, "expected": expected_apps},
+                error_type="AppsComponentNotFound",
+                error_message=f"运行区未找到组件 {service_name}，请先执行安装任务",
+            ),
             "", "", "",
         )
 
-    # bin 目录: {component_dir}/{version}/bin/
-    bin_dir = os.path.join(component_dir, version, "bin")
-    os.makedirs(bin_dir, exist_ok=True)
+    # bin 目录：{apps}/{service_name}/bin
+    # 这是指向 current/bin 的软链接，而 install 阶段已把 current 指向目标版本，
+    # 因此此处实际执行的就是 {version}/bin 下的脚本。
+    bin_dir = os.path.join(component_dir, "bin")
 
     return None, component_dir, version, bin_dir
 
@@ -128,13 +156,15 @@ def _validate_linux_script(script: str) -> List[str]:
             "规则1（后台启动）: 未发现后台启动命令，请在启动命令末尾加 &，或使用 nohup/setsid 等方式"
         )
 
-    # 规则2: 写入主进程 PID — 必须有 $! 并且写入 runtime/pid（含变量引用）
+    # 规则2: 写入主进程 PID — 必须有 $! 并且把 PID 写入 pid 文件
+    # 改造后 pid 统一落在运行区 state/ 下（{apps}/{服务}/state/pid），
+    # 为兼容历史包仍接受 runtime/pid。
     has_pid_capture = bool(re.search(r'\$!', script))
-    has_pid_file = bool(re.search(r'runtime.*[/\\]pid', script, re.IGNORECASE))
+    has_pid_file = bool(re.search(r'(?:state|runtime).*[/\\]pid', script, re.IGNORECASE))
     if not has_pid_capture or not has_pid_file:
         violations.append(
-            "规则2（写入PID）: 必须用 $! 获取主进程 PID 并写入 runtime/pid，"
-            '示例: echo $! > "$RUNTIME_DIR/pid"'
+            "规则2（写入PID）: 必须用 $! 获取主进程 PID 并写入 state/pid，"
+            '示例: echo $! > "$STATE_DIR/pid"'
         )
 
     # 规则3: 返回退出码 — 必须有 exit 语句
@@ -162,12 +192,13 @@ def _validate_windows_script(script: str) -> List[str]:
             '或 PowerShell Start-Process -WindowStyle Hidden'
         )
 
-    # 规则2: 写入主进程 PID — 必须有 runtime 与 \pid 的组合字样
-    #  匹配: runtime\pid、runtime/pid、!RUNTIME_DIR!\pid、%RUNTIME_DIR%\pid 等
-    if not re.search(r'runtime.*[\\/]pid', script, re.IGNORECASE):
+    # 规则2: 写入主进程 PID — 必须有 state/runtime 与 \pid 的组合字样
+    #  匹配: state\pid、state/pid、runtime\pid、!STATE_DIR!\pid 等
+    #  （改造后 pid 统一落在 state/ 下，为兼容历史包仍接受 runtime/pid）
+    if not re.search(r'(?:state|runtime).*[\\/]pid', script, re.IGNORECASE):
         violations.append(
-            r'规则2（写入PID）: 必须将主进程 PID 写入 runtime\pid，'
-            r'示例: echo !PID! > "!RUNTIME_DIR!\pid"'
+            r'规则2（写入PID）: 必须将主进程 PID 写入 state\pid，'
+            r'示例: echo !PID! > "!STATE_DIR!\pid"'
         )
 
     # 规则3: 返回退出码 — 必须有 exit /b 或 exit
@@ -268,11 +299,21 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
 
 
 # =============================================================================
-# 进程端口查询 & application.yml 更新
+# 进程端口查询
 # =============================================================================
+# 注：原 _update_application_yml() 已移除。
+#     它将监听端口写入组件的 application.yml（组件描述文件），
+#     但该文件既无人生成、也无人消费：
+#       · Agent 侧 Nacos 注册已改读 runtime/config.yaml（见 nacos_register.py 变更 v3）
+#       · 后端平台从未读取该文件（IP/端口一律取自数据库实体 NodeEntity/ApplicationEntity）
+#       · /api/component/register 接口后端亦未实现
+#     故连同其专用的 _get_listening_ports() 一并删除，避免无用的文件 I/O。
+
 
 def _get_listening_ports(pid: int):
-    """获取指定进程的 TCP 监听端口列表"""
+    """
+    获取指定进程的 TCP 监听端口列表（返回数据给调用方使用，不再落盘）。
+    """
     try:
         import psutil
         proc = psutil.Process(pid)
@@ -285,113 +326,35 @@ def _get_listening_ports(pid: int):
         return []
 
 
-def _update_application_yml(component_dir: str, version: str, pid_str: str) -> Dict[str, Any]:
-    """
-    用 PID 查询进程监听端口，将 IP 和端口写入 application.yml 的 service 字段。
-
-    流程:
-        1. 根据 PID 查询进程 TCP 监听端口
-        2. 获取本机 IP
-        3. 读取 {component_dir}/{version}/application.yml
-        4. 在 service 字段下写入 ip 和 port
-        5. 写回文件
-
-    返回:
-        {"updated": True/False, "ip": "", "ports": []}
-    """
-    result = {"updated": False, "ip": "", "ports": []}
-
-    if not pid_str:
-        return result
-
-    # 支持多行 PID，取第一个有效值
-    pid = None
-    for line in pid_str.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pid = int(line)
-            break
-        except ValueError:
-            continue
-    if pid is None:
-        return result
-
-    # 查询进程监听端口
-    ports = _get_listening_ports(pid)
-    if not ports:
-        logging.warning("[start_task] 未检测到进程监听端口: pid=%s", pid)
-        return result
-
-    import yaml
-
-    from utils.util import get_ip
-
-    ip = get_ip()
-    result["ip"] = ip
-    result["ports"] = ports
-
-    # 定位 application.yml
-    yml_path = os.path.join(component_dir, version, "application.yml")
-    if not os.path.isfile(yml_path):
-        logging.warning("[start_task] application.yml 不存在: %s", yml_path)
-        return result
-
-    try:
-        with open(yml_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except Exception as e:
-        logging.warning("[start_task] 读取 application.yml 失败: %s", e)
-        return result
-
-    if not isinstance(data, dict):
-        data = {}
-
-    # 在 service 字段下写入 ip 和 port
-    if "service" not in data:
-        data["service"] = {}
-    data["service"]["ip"] = ip
-    data["service"]["port"] = ports[0] if len(ports) == 1 else ports
-
-    try:
-        with open(yml_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
-        result["updated"] = True
-        logging.info("[start_task] application.yml 已更新: service.ip=%s, service.port=%s", ip, ports)
-    except Exception as e:
-        logging.warning("[start_task] 写入 application.yml 失败: %s", e)
-
-    return result
-
-
 # =============================================================================
 # 主入口
 # =============================================================================
 
 def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
     """
-    启动服务任务 — 从 bin/ 目录读取启动脚本并执行。
+    启动服务任务 — 从运行区的 bin/ 目录读取启动脚本并执行。
 
     参数:
         - task_id:      任务ID（必填）
         - service_name: 服务名称（必填），同时也是组件目录名
+        - version:      版本号（必填，后端下发）
 
     脚本强制规则（执行前校验，不通过则拒绝）:
         1. 后台启动应用（不阻塞终端）
-        2. 主进程 PID 写入 {bin_dir}/../runtime/pid
+        2. 主进程 PID 写入 state/pid（兼容历史包的 runtime/pid）
         3. 脚本返回退出码
 
     流程:
-        1. 根据 service_name 在 {base_path}/{service_name}/ 定位组件目录
-        2. 读取 version 文件获取版本号
-        3. 从 {version}/bin/start.sh 读取启动脚本
+        1. 校验缓存区存在该版本目录 {download}/{service_name}/{version}/
+        2. 在运行区定位组件目录 {apps}/{service_name}/（install 建立的软链接结构）
+        3. 从 {apps}/{service_name}/bin/start.sh 读取启动脚本（经 current 软链接）
         4. 校验脚本是否符合三项规则
         5. 执行启动脚本
-        6. 读取 runtime/pid 中的主进程 PID，返回结果
+        6. 读取 state/pid 中的主进程 PID，等待 60 秒确认存活后写入运行状态
     """
     task_id = str(parameters.get("task_id", "") or "").strip()
     service_name = str(parameters.get("service_name", "") or "").strip()
+    version = str(parameters.get("version", "") or "").strip()
 
     # ── 参数校验 ──
     if not task_id:
@@ -400,9 +363,13 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
     if not service_name:
         return _build_result(task_id, False, "参数缺失: service_name",
                              error_type="ParameterMissing", error_message="service_name 缺失")
+    if not version:
+        return _build_result(task_id, False, "参数缺失: version",
+                             error_type="ParameterMissing",
+                             error_message="version 参数缺失，启动需明确指定版本")
 
     # ── 路径解析 ──
-    error, component_dir, version, bin_dir = _resolve_paths(service_name)
+    error, component_dir, version, bin_dir = _resolve_paths(service_name, version)
     if error:
         error["task_id"] = task_id
         error["data"] = {
@@ -440,18 +407,25 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
             error_message="; ".join(violations),
         )
 
-    # runtime/pid 路径
-    runtime_dir = os.path.join(component_dir, version, "runtime")
-    pid_file = os.path.join(runtime_dir, "pid")
+    # ── runtime / pid 路径 ──
+    # runtime 属运行态产物（日志等），落在运行区而非缓存区
+    runtime_dir = os.path.join(_APPS_BASE, service_name, "runtime")
+    # pid 文件放在 state/ 下，与状态文件统一管理：{apps}/{service_name}/state/pid
+    # 由包内 start.sh 负责写入（echo $! > .../state/pid）
+    pid_file = get_pid_file(service_name) or os.path.join(
+        _APPS_BASE, service_name, "state", "pid")
 
-    # 确保 runtime 目录存在（组件脚本可能只写 pid 不建目录）
+    # 预先创建 runtime 与 state 目录（脚本可能只写文件不建目录）
     try:
         os.makedirs(runtime_dir, exist_ok=True)
-        logging.info("[start_task] 已确保 runtime 目录存在: %s", runtime_dir)
+        os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+        logging.info("[start_task] 已确保 runtime/state 目录存在: %s | %s",
+                     runtime_dir, os.path.dirname(pid_file))
     except Exception as e:
         return _build_result(
-            task_id, False, f"创建 runtime 目录失败: {e}",
-            data={"service_name": service_name, "version": version, "runtime_dir": runtime_dir},
+            task_id, False, f"创建 runtime/state 目录失败: {e}",
+            data={"service_name": service_name, "version": version,
+                  "runtime_dir": runtime_dir},
             error_type="RuntimeDirCreateError",
             error_message=str(e),
         )
@@ -486,30 +460,66 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
             error_message=exec_result.get("stderr", "") or f"脚本退出码: {exec_result['exit_code']}",
         )
 
-    # ── 读取 PID ──
-    pid = ""
-    app_yml_result = {}
-    if os.path.isfile(pid_file):
-        try:
-            with open(pid_file, "r", encoding="utf-8") as pf:
-                pid = pf.read().strip()
-            logging.info("[start_task] 主进程 PID: %s", pid)
-        except Exception as e:
-            logging.warning("[start_task] 读取 PID 文件失败: %s", e)
+    # ── 读取脚本写入的 PID（支持多值）──
+    pids = read_pids_from_file(service_name)
+    if not pids:
+        return _build_result(
+            task_id, False, f"启动脚本未写入 pid 文件: {pid_file}",
+            data={**base_data, "exit_code": exec_result["exit_code"],
+                  "stdout": exec_result.get("stdout", "")},
+            error_type="PidFileMissing",
+            error_message="启动脚本执行完成但未找到 pid 文件，请检查 start.sh 是否写入 $!",
+        )
+    logging.info("[start_task] 读取到 PID 列表: %s，等待 %s 秒确认存活",
+                 pids, START_CONFIRM_WAIT)
 
-    # ── 查询端口并写入 application.yml ──
-    if pid:
-        import time as _time
-        _time.sleep(1)  # 给进程一点时间绑定端口
-        app_yml_result = _update_application_yml(component_dir, version, pid)
+    # ── 等待并确认进程存活（多 pid 全部存活才算通过）──
+    # 同步等待：避免"秒退"被误判为启动成功，平台拿到的是终态
+    alive = wait_process_alive(service_name, pids, START_CONFIRM_WAIT)
+    if not alive:
+        return _build_result(
+            task_id, False,
+            f"进程 {pids} 在 {START_CONFIRM_WAIT} 秒内已有退出，启动失败",
+            data={**base_data, "pids": pids, "exit_code": exec_result["exit_code"],
+                  "stdout": exec_result.get("stdout", ""),
+                  "stderr": exec_result.get("stderr", "")},
+            error_type="ProcessNotAlive",
+            error_message=f"启动后 {START_CONFIRM_WAIT} 秒内进程未全部存活",
+        )
+    logging.info("[start_task] PID %s 存活确认通过", pids)
 
-    return _build_result(task_id, True, "启动脚本写入并执行成功", data={
+    # ── 写入运行状态：pids + processes + runtime=true ──
+    processes = get_process_names(pids)
+    state = read_state(service_name)
+    state.update({
+        "pids": pids,
+        "processes": processes,
+        "name": service_name,
+        "runtime": True,
+        "version": version,
+    })
+    # 清理旧的单值字段，避免两份数据并存
+    state.pop("pid", None)
+
+    if not write_state(service_name, state):
+        logging.warning("[start_task] 写入状态文件失败，但不影响服务已启动的事实")
+    logging.info("[start_task] 运行状态已写入: pids=%s processes=%s", pids, processes)
+
+    # ── 探测监听端口（仅用于上报展示，不再写文件）──
+    listen_ports = _get_listening_ports(pids[0]) if pids else []
+    if listen_ports:
+        logging.info("[start_task] 监听端口: %s", listen_ports)
+
+    return _build_result(task_id, True, "启动成功", data={
         **base_data,
         "status": "started",
-        "pid": pid,
+        "pids": pids,
+        "processes": processes,
+        "listen_ports": listen_ports,
+        "runtime": True,
+        "state": state,
         "exit_code": exec_result["exit_code"],
         "stdout": exec_result.get("stdout", ""),
-        "app_yml": app_yml_result,
     })
 
 
@@ -545,21 +555,44 @@ if __name__ == "__main__":
             "exit 0\n"
         )
 
-    # 将测试脚本写入 bin/ 模拟已安装状态
+    # 模拟已下载 + 已安装状态：
+    #   缓存区写入 {download}/{service}/{version}/bin/start.sh
+    #   运行区建立 {apps}/{service}/bin -> current/bin 软链接
     test_service = "hellogitworld-master"
-    test_bin_dir = os.path.join(_DOWNLOAD_BASE, test_service, "1.0.0", "bin") if _DOWNLOAD_BASE else ""
-    if test_bin_dir and not os.path.isfile(os.path.join(test_bin_dir, "start.sh" if os.name != "nt" else "start.bat")):
-        os.makedirs(test_bin_dir, exist_ok=True)
-        ext = ".bat" if os.name == "nt" else ".sh"
-        with open(os.path.join(test_bin_dir, f"start{ext}"), "w", encoding="utf-8") as f:
-            f.write(test_script)
-        if os.name != "nt":
-            os.chmod(os.path.join(test_bin_dir, "start.sh"), 0o755)
+    test_version = "1.0.0"
+    ext = ".bat" if os.name == "nt" else ".sh"
+
+    if _DOWNLOAD_BASE:
+        cache_bin = os.path.join(_DOWNLOAD_BASE, test_service, test_version, "bin")
+        os.makedirs(cache_bin, exist_ok=True)
+        script_file = os.path.join(cache_bin, f"start{ext}")
+        if not os.path.isfile(script_file):
+            with open(script_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(test_script)
+            if os.name != "nt":
+                os.chmod(script_file, 0o755)
+
+    if _APPS_BASE:
+        apps_component = os.path.join(_APPS_BASE, test_service)
+        os.makedirs(apps_component, exist_ok=True)
+        current_link = os.path.join(apps_component, "current")
+        if not os.path.islink(current_link):
+            try:
+                os.symlink(os.path.join(_DOWNLOAD_BASE, test_service, test_version), current_link)
+            except OSError:
+                pass
+        bin_link = os.path.join(apps_component, "bin")
+        if not os.path.islink(bin_link):
+            try:
+                os.symlink(os.path.join("current", "bin"), bin_link)
+            except OSError:
+                pass
 
     result = start_task(
         {
             "task_id": "test-start-001",
             "service_name": test_service,
+            "version": test_version,
         },
     )
 

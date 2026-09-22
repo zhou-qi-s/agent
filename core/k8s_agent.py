@@ -1039,6 +1039,11 @@ def report_k8s_result(
             "message": str(message)
         }
 
+        # Harbor 的「启动/停止/重启」需要把 op 带回，后端据此决定最终状态
+        # （stop 成功 → 已停止；start/restart 成功 → 部署成功）
+        if task.get("op"):
+            payload["op"] = task.get("op")
+
         response = requests.post(
             url,
             json=payload,
@@ -1353,28 +1358,1067 @@ def process_k8s_remove(task: dict):
         _last_script_error.pop(task_id, None)
 
 
-def process_k8s_task(task: dict):
+def _comment_out_https_section(content: str) -> str:
     """
-    完整 K8S 安装流程
+    把 harbor.yml 中的顶层 `https:` 段整体注释掉，使其以 HTTP 模式运行。
+
+    背景：Harbor 官方 harbor.yml.tmpl 里 `https:` 是**激活**的，且
+    certificate/private_key 为占位符（/your/certificate/path）。
+    若不注释，prepare 阶段会报：
+        "The protocol is https but attribute ssl_cert is not set"
+    直接导致安装失败。
+
+    处理范围：从顶层 `https:` 行开始，到下一个「顶格且非注释」的键或文件结束为止。
+    逐行在行首加 `# `，保持缩进不变（YAML 注释后不再解析，缩进不影响）。
+    """
+
+    lines = content.splitlines()
+
+    out = []
+    inside = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not inside:
+            # 命中顶层 https: 段起点
+            if re.match(r"^https:\s*(#.*)?$", line):
+                inside = True
+                out.append("# " + line)
+                continue
+            out.append(line)
+            continue
+
+        # inside == True：判断段落是否结束
+        # 结束条件：非空、非注释、且顶格（缩进为 0）的新键
+        if stripped and not stripped.startswith("#") and not line.startswith((" ", "\t")):
+            inside = False
+            out.append(line)
+            continue
+
+        out.append("# " + line)
+
+    return "\n".join(out) + ("\n" if content.endswith("\n") else "")
+
+
+def _generate_harbor_certs(task_id: str, host_ip: str, cert_dir: str,
+                           ca_source: str = "") -> dict:
+    """
+    为 Harbor 生成 HTTPS 自签证书（一套根 CA + 本节点服务端证书）。
+
+    设计（重要）：
+        · **一套根 CA** 是长期资产，客户端只需装一次 `ca.crt` 即可信任所有 Harbor 节点；
+        · **每台节点单独签一张服务端证书**，SAN 写节点自身 IP，私钥各节点独立
+          （避免同一私钥散落在多台机器上）。
+
+    存放结构（目标机）：
+        {cert_dir}/
+        ├── ca.crt / ca.key          根 CA（根私钥仅本机保留，权限 600）
+        └── {host_ip}.crt / .key     本节点服务端证书
+
+    参数：
+        cert_dir  : 证书目录，通常与 harbor.yml 同目录（Harbor 会读相对路径）
+        ca_source : 若指定且存在，则复用外部 CA（例如平台统一分发的 ca.crt/ca.key
+                    两个文件所在目录）；否则在本机自建一套。
+
+    返回：{"ca_crt":..., "cert":..., "key":...}，失败抛异常。
+    """
+
+    os.makedirs(cert_dir, exist_ok=True)
+    os.chmod(cert_dir, 0o700)
+
+    ca_crt = os.path.join(cert_dir, "ca.crt")
+    ca_key = os.path.join(cert_dir, "ca.key")
+    srv_crt = os.path.join(cert_dir, f"{host_ip}.crt")
+    srv_key = os.path.join(cert_dir, f"{host_ip}.key")
+    csr_path = os.path.join(cert_dir, f"{host_ip}.csr")
+    ext_path = os.path.join(cert_dir, "v3.ext")
+
+    # ---------- 1. 准备根 CA ----------
+    if ca_source and os.path.exists(os.path.join(ca_source, "ca.crt")) \
+            and os.path.exists(os.path.join(ca_source, "ca.key")):
+        # 复用平台统一分发的 CA
+        shutil.copyfile(os.path.join(ca_source, "ca.crt"), ca_crt)
+        shutil.copyfile(os.path.join(ca_source, "ca.key"), ca_key)
+        log_step(task_id, "HARBOR", "复用平台分发的根 CA", source=ca_source)
+    elif not (os.path.exists(ca_crt) and os.path.exists(ca_key)):
+        log_step(task_id, "HARBOR", "生成新的根 CA")
+        ok, out = _run_local([
+            "openssl", "genrsa", "-out", ca_key, "4096"
+        ], timeout=300)
+        if not ok:
+            raise Exception(f"生成 CA 私钥失败: {out}")
+
+        ok, out = _run_local([
+            "openssl", "req", "-x509", "-new", "-nodes",
+            "-key", ca_key, "-sha256", "-days", "3650",
+            "-out", ca_crt,
+            "-subj", "/C=CN/ST=Local/L=Local/O=Harbor/OU=Dev/CN=HarborRootCA",
+        ], timeout=300)
+        if not ok:
+            raise Exception(f"生成 CA 证书失败: {out}")
+        os.chmod(ca_key, 0o600)
+        log_step(task_id, "HARBOR", "根 CA 生成完成", ca=ca_crt)
+    else:
+        log_step(task_id, "HARBOR", "复用本机已有根 CA", ca=ca_crt)
+
+    # ---------- 2. 服务端证书 ----------
+    # SAN 必须包含节点自身 IP，否则客户端按 IP 访问时校验失败
+    san = f"IP:{host_ip},DNS:harbor.local,DNS:localhost,IP:127.0.0.1"
+
+    with open(ext_path, "w", encoding="utf-8") as f:
+        f.write(
+            f"subjectAltName = {san}\n"
+            "extendedKeyUsage = serverAuth\n"
+            "keyUsage = digitalSignature, keyEncipherment\n"
+        )
+
+    log_step(task_id, "HARBOR", "生成本节点服务端证书", host=host_ip, san=san)
+
+    ok, out = _run_local(["openssl", "genrsa", "-out", srv_key, "4096"], timeout=300)
+    if not ok:
+        raise Exception(f"生成服务端私钥失败: {out}")
+
+    ok, out = _run_local([
+        "openssl", "req", "-new",
+        "-key", srv_key, "-out", csr_path,
+        "-subj", f"/C=CN/ST=Local/L=Local/O=Harbor/OU=Dev/CN={host_ip}",
+    ], timeout=300)
+    if not ok:
+        raise Exception(f"生成 CSR 失败: {out}")
+
+    ok, out = _run_local([
+        "openssl", "x509", "-req",
+        "-in", csr_path, "-CA", ca_crt, "-CAkey", ca_key, "-CAcreateserial",
+        "-out", srv_crt, "-days", "3650", "-sha256",
+        "-extfile", ext_path,
+    ], timeout=300)
+    if not ok:
+        raise Exception(f"签发服务端证书失败: {out}")
+    os.chmod(srv_key, 0o600)
+
+    # ---------- 3. 校验 ----------
+    ok, out = _run_local([
+        "openssl", "x509", "-in", srv_crt, "-noout", "-subject", "-ext", "subjectAltName"
+    ], timeout=60)
+    if not ok:
+        raise Exception(f"服务端证书校验失败: {out}")
+
+    log_step(task_id, "HARBOR", "证书签发完成",
+             subject=out.splitlines()[0] if out else "", cert=srv_crt)
+
+    return {"ca_crt": ca_crt, "cert": srv_crt, "key": srv_key}
+
+
+def _remove_ca_trust(task_id: str, host_ip, harbor_port) -> bool:
+    """
+    卸载 Harbor 时移除本机对该 CA 的信任（docker 证书目录 + 系统信任库）。
+
+    不重启 docker：证书目录变更为「少了信任源」，对已有容器无影响，
+    下次 docker 重启自然生效；重启反而会打断无关容器。
+    """
+
+    removed = []
+
+    if host_ip and harbor_port:
+        d_dir = f"/etc/docker/certs.d/{host_ip}:{harbor_port}"
+        if os.path.isdir(d_dir):
+            shutil.rmtree(d_dir, ignore_errors=True)
+            removed.append(d_dir)
+
+    sys_crt = "/usr/local/share/ca-certificates/harbor-ca.crt"
+    if os.path.exists(sys_crt):
+        os.remove(sys_crt)
+        _run_local(["update-ca-certificates", "--fresh"], timeout=180)
+        removed.append(sys_crt)
+
+    if removed:
+        log_step(task_id, "HARBOR", "已移除 CA 信任", paths=removed)
+    else:
+        log_step(task_id, "HARBOR", "无 CA 信任需要清理")
+    return True
+
+
+def _trust_ca_for_docker(task_id: str, ca_crt: str, host_ip: str, harbor_port) -> bool:
+    """
+    让本机 docker 信任 Harbor 的自签根 CA（HTTPS 模式必需）。
+
+    为什么需要：docker 对 registry 的证书校验走自己的目录
+        /etc/docker/certs.d/{host}:{port}/ca.crt
+    不放这张 CA，push/pull 会报：
+        x509: certificate signed by unknown authority
+
+    说明：
+        · 同时写入系统信任库（/usr/local/share/ca-certificates + update-ca-certificates），
+          让 curl/wget 等工具也能访问；
+        · **不再需要 insecure-registries**（HTTPS 模式下它是多余的，
+          且会削弱证书校验的意义）。
+    """
+
+    if not os.path.exists(ca_crt):
+        log_step(task_id, "HARBOR", "CA 证书不存在，跳过 docker 信任配置", ca=ca_crt)
+        return False
+
+    if not host_ip or not harbor_port:
+        log_step(task_id, "HARBOR", "缺少 host/port，跳过 docker 信任配置")
+        return False
+
+    try:
+        # 1) docker 专用证书目录：目录名必须是 host:port
+        d_dir = f"/etc/docker/certs.d/{host_ip}:{harbor_port}"
+        os.makedirs(d_dir, exist_ok=True)
+        shutil.copyfile(ca_crt, os.path.join(d_dir, "ca.crt"))
+        log_step(task_id, "HARBOR", "已配置 docker 信任 CA", dir=d_dir)
+
+        # 2) 系统信任库（顺带让 curl 等工具可用）
+        sys_dir = "/usr/local/share/ca-certificates"
+        os.makedirs(sys_dir, exist_ok=True)
+        sys_crt = os.path.join(sys_dir, "harbor-ca.crt")
+        shutil.copyfile(ca_crt, sys_crt)
+        ok, out = _run_local(["update-ca-certificates"], timeout=180)
+        if ok:
+            log_step(task_id, "HARBOR", "已安装到系统信任库", file=sys_crt)
+        else:
+            log_step(task_id, "HARBOR", "update-ca-certificates 失败（不阻断）", detail=out[:200])
+
+        # 3) 重启 docker 使证书目录生效
+        #    ⚠️ 此时 Harbor 尚未安装，重启 docker 无副作用
+        ok, out = _run_local(["systemctl", "restart", "docker"], timeout=300)
+        if not ok:
+            ok2, out2 = _run_local("service docker restart", shell=True, timeout=300)
+            if not ok2:
+                raise Exception(f"docker 重启失败: {out2}")
+
+        for _ in range(30):
+            ok3, _o = _run_local(["docker", "info"], timeout=30)
+            if ok3:
+                break
+            time.sleep(2)
+
+        ok4, ver = _run_local(["docker", "version", "--format", "{{.Server.Version}}"], timeout=60)
+        if not ok4:
+            raise Exception("docker 重启后不可用")
+
+        log_step(task_id, "HARBOR", "docker 已重启，CA 信任生效", version=ver.strip())
+        return True
+
+    except Exception as e:
+        # 不阻断安装：Harbor 本体仍能起，只是本机 push 需要人工补配置
+        log_step(task_id, "HARBOR", "配置 CA 信任失败（不阻断安装）", error=str(e))
+        return False
+
+
+def _remove_docker_insecure_registry(task_id: str, host_ip, harbor_port) -> bool:
+    """
+    从 docker 的 insecure-registries 中移除本机 Harbor 地址（卸载时调用）。
+
+    注意：**不重启 docker** —— 卸载场景下重启会打断其它无关容器，
+    而 daemon.json 的改动在下次 docker 重启时自然生效，无副作用。
+    """
+
+    daemon_json = "/etc/docker/daemon.json"
+    if not os.path.exists(daemon_json):
+        return False
+
+    try:
+        with open(daemon_json, "r", encoding="utf-8") as f:
+            txt = f.read().strip()
+        if not txt:
+            return False
+        current = json.loads(txt)
+    except Exception as e:
+        log_step(task_id, "HARBOR", "daemon.json 读取失败，跳过清理", error=str(e))
+        return False
+
+    existing = current.get("insecure-registries") or []
+    if not isinstance(existing, list) or not existing:
+        return False
+
+    targets = set()
+    if host_ip and harbor_port:
+        targets.add(f"{host_ip}:{harbor_port}")
+        targets.add(f"127.0.0.1:{harbor_port}")
+
+    kept = [x for x in existing if x not in targets]
+    if len(kept) == len(existing):
+        log_step(task_id, "HARBOR", "insecure-registries 无需清理")
+        return True
+
+    if kept:
+        current["insecure-registries"] = kept
+    else:
+        current.pop("insecure-registries", None)
+
+    with open(daemon_json, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2, ensure_ascii=False)
+
+    log_step(task_id, "HARBOR", "已从 insecure-registries 移除 Harbor 地址",
+             removed=list(targets), kept=kept)
+    return True
+
+
+def _restart_harbor_if_present(task_id: str) -> bool:
+    """
+    若目标机上已有 Harbor 部署目录，用 compose 把它重新拉起。
+
+    为什么需要：`systemctl restart docker` 会终止所有运行中的容器。
+    Harbor 的容器由 compose 管理，重启 docker 后不会全部自动恢复
+    （实测会以 Exit 128 退出，只剩 core/log 两个，端口不再监听）。
+    因此在重启 docker 后必须显式 `docker compose up -d` 复原。
+
+    前提：调用方已知道 installDir；这里用固定默认值探测，
+    未找到部署目录则静默跳过（属首次安装路径的常态）。
+    """
+
+    candidates = ["/opt/harbor"]
+    for d in candidates:
+        compose = os.path.join(d, "docker-compose.yml")
+        if not os.path.exists(compose):
+            continue
+
+        log_step(task_id, "HARBOR", "检测到已有 Harbor 部署，重启 docker 后正在恢复",
+                 dir=d)
+
+        ok, out = _run_local(
+            ["docker", "compose", "up", "-d"],
+            cwd=d,
+            timeout=900,
+        )
+        if not ok:
+            ok2, out2 = _run_local(
+                ["docker-compose", "up", "-d"],
+                cwd=d,
+                timeout=900,
+            )
+            if not ok2:
+                log_step(task_id, "HARBOR", "恢复 Harbor 失败（不阻断）", error=out2)
+                return False
+
+        # 等待端口重新监听
+        for _ in range(24):
+            time.sleep(5)
+            _ok, ps = _run_local(
+                "docker ps --filter 'status=running' --format '{{.Names}}' | grep -qi harbor && echo UP || echo DOWN",
+                shell=True,
+                timeout=30,
+            )
+            if "UP" in (ps or ""):
+                log_step(task_id, "HARBOR", "Harbor 已恢复运行")
+                return True
+
+        log_step(task_id, "HARBOR", "Harbor 恢复命令已执行，但容器未全部就绪",
+                 detail=(out or "")[:300])
+        return False
+
+    return False
+
+
+def _ensure_docker_insecure_registry(task_id: str, host_ip: str, harbor_port) -> bool:
+    """
+    把本机 Harbor 地址写入 docker 的 insecure-registries，使 HTTP 模式的 Harbor 可被 docker 推送/拉取。
+
+    为什么必须做：Harbor 以 HTTP 提供 registry 服务时，docker 默认按 HTTPS 访问，
+    会报：
+        Get "https://<host>:<port>/v2/": http: server gave HTTP response to HTTPS client
+    表现为「Harbor 装好了但一个镜像都推不进去」，功能等于不可用。
+
+    做法：
+        1. 读取或创建 /etc/docker/daemon.json；
+        2. 若 insecure-registries 已包含该地址则跳过（幂等）；
+        3. 否则追加并重启 docker（Harbor 此时尚未安装，重启 docker 无影响）。
+
+    重启 docker 的时机放在 Harbor 安装之前，避免打断刚起来的 Harbor 容器。
+    """
+
+    if not host_ip or not harbor_port:
+        log_step(task_id, "HARBOR", "跳过 insecure-registries 配置（缺少 hostname 或 port）")
+        return False
+
+    # 同时写入「ip:port」两种常见写法，保证不同 docker 版本都能识别
+    entries = [f"{host_ip}:{harbor_port}"]
+
+    daemon_json = "/etc/docker/daemon.json"
+
+    try:
+        current = {}
+        if os.path.exists(daemon_json):
+            try:
+                with open(daemon_json, "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                if txt:
+                    current = json.loads(txt)
+            except Exception as e:
+                log_step(task_id, "HARBOR", "daemon.json 解析失败，将重建",
+                         error=str(e))
+                current = {}
+
+        existing = current.get("insecure-registries") or []
+        if not isinstance(existing, list):
+            existing = []
+
+        added = [e for e in entries if e not in existing]
+        if not added:
+            log_step(task_id, "HARBOR", "docker 已信任该 Harbor 地址，无需修改",
+                     registries=existing)
+            return True
+
+        merged = existing + added
+        # 去重并保持稳定顺序
+        seen = set()
+        merged = [x for x in merged if not (x in seen or seen.add(x))]
+
+        current["insecure-registries"] = merged
+
+        os.makedirs(os.path.dirname(daemon_json), exist_ok=True)
+        with open(daemon_json, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2, ensure_ascii=False)
+
+        log_step(task_id, "HARBOR", "已写入 docker insecure-registries",
+                 file=daemon_json, registries=merged)
+
+        # 重启 docker 使其生效（此时 Harbor 还没装，不会影响其容器）
+        ok, out = _run_local(["systemctl", "restart", "docker"], timeout=300)
+        if not ok:
+            # 非 systemd 环境兜底
+            ok2, out2 = _run_local("service docker restart", shell=True, timeout=300)
+            if not ok2:
+                raise Exception(f"docker 重启失败: {out2}")
+
+        # 等待 docker 就绪
+        for _ in range(30):
+            ok3, _o = _run_local(["docker", "info"], timeout=30)
+            if ok3:
+                break
+            time.sleep(2)
+
+        ok4, ver = _run_local(["docker", "version", "--format", "{{.Server.Version}}"], timeout=60)
+        if not ok4:
+            raise Exception("docker 重启后不可用，请检查 docker 服务状态")
+
+        log_step(task_id, "HARBOR", "docker 已重启并生效",
+                 server_version=ver.strip())
+
+        # ⚠️ 关键：`systemctl restart docker` 会把所有运行中的容器杀掉
+        # （Harbor 的 compose 容器会以 Exit 128 退出）。
+        # 因此在「已装 Harbor 再重装/修复」的场景下，必须把 Harbor 重新拉起，
+        # 否则重启 docker 反而把好好的服务弄挂了。
+        _restart_harbor_if_present(task_id)
+
+        return True
+
+    except Exception as e:
+        # 该步骤失败不应阻断 Harbor 安装，但要明确记录（Harbor 本体仍可用，
+        # 只是本机 docker 推送需要人工补配置）
+        log_step(task_id, "HARBOR", "配置 insecure-registries 失败（不阻断安装）",
+                 error=str(e))
+        return False
+
+
+def process_harbor_install(task: dict):
+    """
+    HARBOR 节点：安装 Harbor 与 Helm
+
+    由后端先行检测并推包，本函数只负责执行本机的安装脚本：
+        1. 解压后端推送过来的离线包（harbor / helm）
+        2. 安装 harbor：进入 installDir 执行 install.sh
+        3. 安装 helm：解压后把二进制拷到 installPath
+        4. 上报最终结果
+
+    任务字段（由后端 install_harbor 接口下发）:
+        id            : 节点ID
+        action        : install_harbor
+        arch          : uname -m 结果
+        needHarbor    : 是否需要装 harbor
+        needHelm      : 是否需要装 helm
+        harborPackage : harbor 离线包在目标机上的绝对路径（可选）
+        helmPackage   : helm 离线包在目标机上的绝对路径（可选）
+        installDir    : harbor 安装目录，如 /opt/harbor
+        helmInstallPath: helm 二进制安装路径，如 /usr/local/bin/helm
+    """
+
+    task_id = str(task.get("id"))
+
+    success = False
+
+    message = ""
+
+    try:
+
+        log_step(
+            task_id,
+            "HARBOR",
+            "开始安装 Harbor / Helm",
+            task=task
+        )
+
+        need_harbor = bool(task.get("needHarbor"))
+        need_helm = bool(task.get("needHelm"))
+        need_compose = bool(task.get("needCompose"))
+
+        if not need_harbor and not need_helm:
+            success = True
+            message = "Harbor 与 Helm 均已安装，无需处理"
+            return {"taskId": task_id, "success": True}
+
+        # =================================================
+        # 0) 安装 docker compose 插件
+        # =================================================
+        # Harbor 的 install.sh 会调 common.sh，其中强制校验 docker compose
+        # 或 docker-compose 至少一个可用，否则直接 error 退出。
+        # 因此必须在跑 install.sh 之前把 compose 补齐。
+
+        if need_compose:
+            compose_pkg = (task.get("composePackage") or "").strip()
+            compose_install_path = (
+                task.get("composeInstallPath")
+                or "/usr/libexec/docker/cli-plugins/docker-compose"
+            ).strip()
+
+            if not compose_pkg:
+                raise Exception("未收到 docker-compose 插件包路径")
+
+            if not os.path.exists(compose_pkg):
+                raise Exception(f"docker-compose 插件包不存在: {compose_pkg}")
+
+            log_step(task_id, "HARBOR", "开始安装 docker compose 插件",
+                     package=compose_pkg)
+
+            dest_dir = os.path.dirname(compose_install_path)
+            os.makedirs(dest_dir, exist_ok=True)
+
+            ok, out = _run_local(["cp", "-f", compose_pkg, compose_install_path])
+            if not ok:
+                raise Exception(f"docker-compose 插件拷贝失败: {out}")
+            os.chmod(compose_install_path, 0o755)
+
+            # 兼容旧写法：同时提供 /usr/bin/docker-compose 软链，
+            # 某些脚本/文档仍按老命令调用
+            if compose_install_path != "/usr/bin/docker-compose":
+                _run_local(
+                    ["ln", "-sf", compose_install_path, "/usr/bin/docker-compose"]
+                )
+
+            ok, out = _run_local(["docker", "compose", "version"])
+            if not ok:
+                raise Exception(f"docker-compose 插件安装后校验失败: {out}")
+
+            log_step(task_id, "HARBOR", "docker compose 插件安装完成",
+                     version=out.strip().splitlines()[0] if out.strip() else "")
+
+        # =================================================
+        # 1) 安装 Helm
+        # =================================================
+
+        if need_helm:
+            helm_pkg = (task.get("helmPackage") or "").strip()
+            helm_install_path = (task.get("helmInstallPath") or "/usr/local/bin/helm").strip()
+
+            if not helm_pkg:
+                raise Exception("未收到 Helm 离线包路径")
+
+            if not os.path.exists(helm_pkg):
+                raise Exception(f"Helm 离线包不存在: {helm_pkg}")
+
+            log_step(task_id, "HARBOR", "开始安装 Helm", package=helm_pkg)
+
+            extract_dir = os.path.join("/tmp", f"helm-{task_id}")
+            os.makedirs(extract_dir, exist_ok=True)
+            ok, out = _run_local(
+                ["tar", "-xzf", helm_pkg, "-C", extract_dir]
+            )
+            if not ok:
+                raise Exception(f"Helm 包解压失败: {out}")
+
+            # helm-vX.Y.Z-linux-amd64/linux-amd64/helm
+            bin_src = None
+            for root, _dirs, files in os.walk(extract_dir):
+                if "helm" in files:
+                    bin_src = os.path.join(root, "helm")
+                    break
+            if not bin_src:
+                raise Exception("Helm 包内未找到 helm 二进制")
+
+            os.makedirs(os.path.dirname(helm_install_path), exist_ok=True)
+            ok, out = _run_local(["cp", "-f", bin_src, helm_install_path])
+            if not ok:
+                raise Exception(f"Helm 二进制拷贝失败: {out}")
+            os.chmod(helm_install_path, 0o755)
+
+            ok, out = _run_local([helm_install_path, "version", "--short"])
+            if not ok:
+                raise Exception(f"Helm 安装后校验失败: {out}")
+
+            log_step(task_id, "HARBOR", "Helm 安装完成", version=out.strip())
+
+        # =================================================
+        # 2) 安装 Harbor
+        # =================================================
+
+        if need_harbor:
+            harbor_pkg = (task.get("harborPackage") or "").strip()
+            install_dir = (task.get("installDir") or "/opt/harbor").strip()
+
+            if not harbor_pkg:
+                raise Exception("未收到 Harbor 离线包路径")
+
+            if not os.path.exists(harbor_pkg):
+                raise Exception(f"Harbor 离线包不存在: {harbor_pkg}")
+
+            log_step(task_id, "HARBOR", "开始安装 Harbor", package=harbor_pkg)
+
+            parent = os.path.dirname(install_dir.rstrip("/")) or "/opt"
+
+            # 清理上次残留：上次安装失败会留下半套目录（只有 harbor.yml、容器全无），
+            # 直接在其上重新解压会因文件冲突/状态错乱导致 install.sh 失败。
+            # 注意：只在目录存在但服务未运行时清理；正常运行中的 Harbor 不会走到这里
+            # （后端已判定 needHarbor=false 才跳过）。
+            if os.path.isdir(install_dir):
+                log_step(task_id, "HARBOR", "清理上次残留目录", path=install_dir)
+                # 先尝试停掉可能存在的容器（忽略失败）
+                _run_local(
+                    ["docker", "compose", "down", "-v"],
+                    cwd=install_dir,
+                    timeout=300,
+                )
+                shutil.rmtree(install_dir, ignore_errors=True)
+
+            os.makedirs(parent, exist_ok=True)
+            ok, out = _run_local(
+                ["tar", "-xzf", harbor_pkg, "-C", parent]
+            )
+            if not ok:
+                raise Exception(f"Harbor 包解压失败: {out}")
+
+            real_dir = install_dir
+            if not os.path.isdir(real_dir):
+                # 兜底：包内目录名可能与预期不同，找 install.sh 所在目录
+                found = None
+                for root, _dirs, files in os.walk(parent):
+                    if "install.sh" in files and "prepare" in files:
+                        found = root
+                        break
+                if found:
+                    real_dir = found
+                else:
+                    raise Exception(f"Harbor 解压后未找到 install.sh，目录: {parent}")
+
+            # 始终由模板重新生成 harbor.yml：
+            # 保证 hostname / 端口 / 密码与本节点平台配置一致，
+            # 避免沿用上一次（可能属于别的机器或旧端口）的残留配置。
+            yml_path = os.path.join(real_dir, "harbor.yml")
+            tmpl_path = os.path.join(real_dir, "harbor.yml.tmpl")
+            if os.path.exists(tmpl_path):
+                shutil.copyfile(tmpl_path, yml_path)
+
+                host_ip = task.get("hostname") or _get_local_ip()
+                harbor_port = task.get("harborPort")
+                admin_pwd = (task.get("harborPassword") or "").strip()
+
+                # HTTPS 端口：默认 443 需 root 且常被占用，统一改为「HTTP 端口 + 1」
+                # 例如 http=30002 → https=30003。
+                # ⚠️ 必须在「配置 docker 信任」之前算出来：certs.d 的目录名是
+                # {ip}:{https_port}，用错端口会导致 docker push 找不到 CA。
+                https_port = None
+                if harbor_port:
+                    try:
+                        https_port = int(harbor_port) + 1
+                    except (TypeError, ValueError):
+                        https_port = None
+
+                # ---------- HTTPS：生成证书 ----------
+                # 一套根 CA + 本节点独立服务端证书（SAN 含节点 IP），
+                # 之后 harbor.yml 的 https 段指向它，免去明文传输。
+                cert_dir = os.path.join(real_dir, "certs")
+                certs = _generate_harbor_certs(
+                    task_id, host_ip, cert_dir,
+                    ca_source=(task.get("caSource") or "").strip(),
+                )
+
+                # 让本机 docker 信任这张自签 CA（否则 docker push 报
+                # x509: certificate signed by unknown authority）
+                # 注意传 https_port（docker 走的是 https 端口）
+                _trust_ca_for_docker(
+                    task_id, certs["ca_crt"], host_ip,
+                    https_port if https_port else harbor_port,
+                )
+
+                with open(yml_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                content = re.sub(r"(?m)^hostname:.*$", f"hostname: {host_ip}", content)
+
+                # 把 https 段的占位证书路径替换为真实证书路径（相对 installDir）
+                content = re.sub(
+                    r"(?m)^(\s*)certificate:\s*.*$",
+                    lambda mm: f"{mm.group(1)}certificate: {certs['cert']}",
+                    content, count=1,
+                )
+                content = re.sub(
+                    r"(?m)^(\s*)private_key:\s*.*$",
+                    lambda mm: f"{mm.group(1)}private_key: {certs['key']}",
+                    content, count=1,
+                )
+
+                # 改 https 段下的端口
+                if https_port:
+                    content = re.sub(
+                        r"(?m)^(https:\n(?:.*\n)*?\s*)port:\s*\d+\s*$",
+                        lambda mm: f"{mm.group(1)}port: {https_port}",
+                        content, count=1,
+                    )
+
+                # http 端口：https 启用后 http 会 30x 跳转到 https，保留以便旧脚本兼容
+                if harbor_port:
+                    content = re.sub(
+                        r"(?m)^(?P<indent>\s*)port:\s*80\s*$",
+                        lambda mm: f"{mm.group('indent')}port: {harbor_port}",
+                        content,
+                        count=1,
+                    )
+                if admin_pwd:
+                    content = re.sub(
+                        r"(?m)^harbor_admin_password:.*$",
+                        f"harbor_admin_password: {admin_pwd}",
+                        content,
+                    )
+                with open(yml_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+                log_step(task_id, "HARBOR", "已生成 harbor.yml（HTTPS 模式）",
+                         hostname=host_ip, http_port=str(harbor_port or ""),
+                         https_port=str(https_port or ""),
+                         cert=certs["cert"])
+            else:
+                log_step(task_id, "HARBOR", "未找到 harbor.yml.tmpl，沿用包内 harbor.yml")
+
+            install_sh = os.path.join(real_dir, "install.sh")
+            if not os.path.exists(install_sh):
+                raise Exception(f"install.sh 不存在: {install_sh}")
+
+            os.chmod(install_sh, 0o755)
+            ok, out = _run_local(
+                ["bash", "install.sh"],
+                cwd=real_dir,
+                timeout=3600,
+            )
+            if not ok:
+                raise Exception(f"Harbor 安装失败: {out}")
+
+            log_step(task_id, "HARBOR", "Harbor 安装完成")
+
+        success = True
+
+        message = "Harbor / Helm 安装成功"
+
+        log_step(task_id, "SUCCESS", message)
+
+        return {"taskId": task_id, "success": True}
+
+    except Exception as e:
+
+        success = False
+
+        message = str(e)
+
+        logging.exception(f"[HARBOR][{task_id}] 安装任务失败")
+
+        return None
+
+    finally:
+
+        report_k8s_result(
+            task,
+            success,
+            message
+        )
+
+
+def process_harbor_operate(task: dict):
+    """
+    HARBOR 节点：启动 / 停止 / 重启 Harbor 服务
+
+    与「安装」「卸载」的区别：**不做任何包的传输与目录的增删**，
+    只对已有的 Harbor 部署执行 compose 级别的启停，数据卷与安装目录全部保留。
+
+    任务字段：
+        op         : start / stop / restart
+        installDir : Harbor 安装目录，如 /opt/harbor
+    """
+
+    task_id = str(task.get("id"))
+    op = (task.get("op") or "").strip().lower()
+
+    success = False
+    message = ""
+
+    try:
+        log_step(task_id, "HARBOR", "开始执行 Harbor 操作", op=op, task=task)
+
+        if op not in ("start", "stop", "restart"):
+            raise Exception(f"不支持的操作: {op}")
+
+        install_dir = (task.get("installDir") or "/opt/harbor").strip()
+        compose_file = os.path.join(install_dir, "docker-compose.yml")
+
+        if not os.path.exists(compose_file):
+            raise Exception(f"Harbor 未部署（找不到 {compose_file}），无法执行 {op}")
+
+        # 优先用 compose 插件，失败回退旧版 docker-compose 命令
+        def _compose(args, timeout=900):
+            ok, out = _run_local(["docker", "compose"] + args, cwd=install_dir, timeout=timeout)
+            if not ok:
+                ok2, out2 = _run_local(["docker-compose"] + args, cwd=install_dir, timeout=timeout)
+                if not ok2:
+                    return False, out2
+                return True, out2
+            return True, out
+
+        if op == "stop":
+            log_step(task_id, "HARBOR", "停止 Harbor 容器")
+            # 注意：用 stop 而非 down —— down 会删除容器，stop 保留以便快速重启
+            ok, out = _compose(["stop"])
+            if not ok:
+                raise Exception(f"停止 Harbor 失败: {out}")
+            log_step(task_id, "HARBOR", "Harbor 已停止（数据与配置已保留）")
+
+        elif op == "start":
+            log_step(task_id, "HARBOR", "启动 Harbor 容器")
+            ok, out = _compose(["start"])
+            if not ok:
+                # 若容器已被删除，用 up -d 重建
+                log_step(task_id, "HARBOR", "compose start 失败，改用 up -d 重建容器")
+                ok2, out2 = _compose(["up", "-d"])
+                if not ok2:
+                    raise Exception(f"启动 Harbor 失败: {out2}")
+            log_step(task_id, "HARBOR", "Harbor 启动命令已执行")
+
+        else:  # restart
+            log_step(task_id, "HARBOR", "重启 Harbor 容器")
+            ok, out = _compose(["restart"])
+            if not ok:
+                log_step(task_id, "HARBOR", "compose restart 失败，改用 down + up 重建")
+                _compose(["down"])
+                ok2, out2 = _compose(["up", "-d"])
+                if not ok2:
+                    raise Exception(f"重启 Harbor 失败: {out2}")
+            log_step(task_id, "HARBOR", "Harbor 重启命令已执行")
+
+        # 等待就绪（最多 3 分钟）
+        deadline = time.time() + 180
+        ready = False
+        while time.time() < deadline:
+            _ok, ps = _run_local(
+                "docker ps --filter 'status=running' --format '{{.Names}}' | grep -qi harbor && echo UP || echo DOWN",
+                shell=True, timeout=30,
+            )
+            if op == "stop":
+                # 停止场景：期望「没有运行中的 harbor 容器」
+                if "DOWN" in (ps or ""):
+                    ready = True
+                    break
+            else:
+                if "UP" in (ps or ""):
+                    # 再等端口就绪
+                    _ok2, port_chk = _run_local(
+                        "curl -sk -o /dev/null -w '%{http_code}' -m 8 "
+                        "https://127.0.0.1:$(grep -A3 '^https:' "
+                        + compose_file.replace("docker-compose.yml", "harbor.yml")
+                        + " | grep 'port:' | head -1 | grep -oE '[0-9]+')/api/v2.0/ping 2>/dev/null || echo 000",
+                        shell=True, timeout=30,
+                    )
+                    if "200" in (port_chk or ""):
+                        ready = True
+                        break
+            time.sleep(5)
+
+        if not ready:
+            log_step(task_id, "HARBOR", f"{op} 已完成但就绪检测未通过（不视为失败）",
+                     op=op)
+
+        success = True
+        message = {
+            "start": "Harbor 启动成功",
+            "stop": "Harbor 已停止（数据保留）",
+            "restart": "Harbor 重启成功",
+        }[op]
+
+        log_step(task_id, "SUCCESS", message)
+
+        return {"taskId": task_id, "success": True}
+
+    except Exception as e:
+
+        success = False
+        message = str(e)
+        logging.exception(f"[HARBOR][{task_id}] {op} 操作失败")
+        return None
+
+    finally:
+
+        report_k8s_result(task, success, message)
+
+
+def process_harbor_uninstall(task: dict):
+    """
+    HARBOR 节点：卸载 Harbor 与 Helm
 
     流程:
-        1. 创建任务目录
-        2. 登录节点
-        3. 下载离线包
-        4. SHA256 校验
-        5. 解压 ZIP
-        6. 查找安装脚本
-        7. 执行脚本
-        8. 实时日志上报
-        9. 上报最终结果
-        10. 清理目录
+        1. 停止并删除 harbor 容器（docker compose down）
+        2. 删除安装目录
+        3. 删除 helm 二进制
+        4. 上报最终结果
     """
+
+    task_id = str(task.get("id"))
+
+    success = False
+
+    message = ""
+
+    try:
+
+        log_step(task_id, "HARBOR", "开始卸载 Harbor / Helm", task=task)
+
+        install_dir = (task.get("installDir") or "/opt/harbor").strip()
+        helm_path = (task.get("helmInstallPath") or "/usr/local/bin/helm").strip()
+
+        # ---- Harbor ----
+        compose_file = os.path.join(install_dir, "docker-compose.yml")
+        if os.path.exists(compose_file):
+            log_step(task_id, "HARBOR", "停止 Harbor 容器")
+            ok, out = _run_local(
+                ["docker", "compose", "down", "-v"],
+                cwd=install_dir,
+                timeout=900,
+            )
+            if not ok:
+                # 兼容旧版 docker-compose
+                ok2, out2 = _run_local(
+                    ["docker-compose", "down", "-v"],
+                    cwd=install_dir,
+                    timeout=900,
+                )
+                if not ok2:
+                    log_step(task_id, "HARBOR", "停止容器告警（继续清理）", detail=out2)
+            log_step(task_id, "HARBOR", "Harbor 容器已停止")
+
+        # 兜底：清掉残留 harbor 容器
+        _run_local(
+            "docker ps -a --format '{{.Names}}' | grep -i harbor | xargs -r docker rm -f",
+            shell=True,
+        )
+
+        if os.path.isdir(install_dir):
+            shutil.rmtree(install_dir, ignore_errors=True)
+            log_step(task_id, "HARBOR", "已删除 Harbor 安装目录", path=install_dir)
+
+        # ---- Helm ----
+        if os.path.exists(helm_path):
+            os.remove(helm_path)
+            log_step(task_id, "HARBOR", "已删除 helm 二进制", path=helm_path)
+
+        # ---- docker insecure-registries：摘掉本机 Harbor 地址 ----
+        # 卸载后该地址已不存在，留在 daemon.json 里无意义；
+        # 且若以后在本机换端口重装，旧条目会造成干扰。属尽力而为，失败不阻断。
+        try:
+            _remove_docker_insecure_registry(task_id, task.get("hostname"), task.get("harborPort"))
+        except Exception as e:
+            log_step(task_id, "HARBOR", "清理 insecure-registries 失败（忽略）", error=str(e))
+
+        # ---- docker 证书目录 / 系统信任库：摘掉本机 Harbor 的 CA ----
+        try:
+            _remove_ca_trust(task_id, task.get("hostname"), task.get("harborPort"))
+        except Exception as e:
+            log_step(task_id, "HARBOR", "清理 CA 信任失败（忽略）", error=str(e))
+
+        success = True
+        message = "Harbor / Helm 卸载成功"
+
+        log_step(task_id, "SUCCESS", message)
+
+        return {"taskId": task_id, "success": True}
+
+    except Exception as e:
+
+        success = False
+
+        message = str(e)
+
+        logging.exception(f"[HARBOR][{task_id}] 卸载任务失败")
+
+        return None
+
+    finally:
+
+        report_k8s_result(
+            task,
+            success,
+            message
+        )
+
+
+def _run_local(cmd, cwd=None, timeout=600, shell=False):
+    """
+    执行本机命令（Harbor/Helm 安装用，不涉及集群）
+
+    返回:
+        (ok: bool, output: str)
+    """
+
+    try:
+
+        if shell:
+
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+            )
+
+        else:
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+            )
+
+    except subprocess.TimeoutExpired:
+
+        return False, f"命令超时（{timeout}s）: {cmd}"
+
+    except Exception as e:
+
+        return False, f"命令异常: {e}"
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+
+    return proc.returncode == 0, out.strip()
+
+
+def process_k8s_task(task: dict):
 
     task_id = str(task.get("id"))
 
     # 检测是否为移除任务
     if task.get("action") == "remove":
         return process_k8s_remove(task)
+
+    # HARBOR 节点：安装 / 卸载 Harbor 与 Helm（与本文件的 K8s 流程互不影响）
+    if task.get("action") == "install_harbor":
+        return process_harbor_install(task)
+
+    if task.get("action") == "uninstall_harbor":
+        return process_harbor_uninstall(task)
+
+    # HARBOR 节点：启动 / 停止 / 重启 Harbor 服务（不重装，数据保留）
+    if task.get("action") == "operate_harbor":
+        return process_harbor_operate(task)
 
     success = False
 

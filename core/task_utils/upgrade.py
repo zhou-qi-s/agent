@@ -1,8 +1,19 @@
 """
 升级服务任务模块
 
-基于统一目录结构，实现版本升级的完整流程：
-版本比对 → 停止旧版本 → 下载新版本 → 安装 → 启动
+完整流程：版本比对 → 校验缓存区已下载版本 → 停止旧版本 → 安装 → 启动（**不再下载**）
+
+缓存区/运行区分离后：
+    · 版本来源   → state/config.yaml 的 version 字段（原为 {component}/version 文件）
+    · 组件定位   → 运行区 {server.apps}/{service_name}/
+    · 升级动作   → **不再下载**：升级入口只允许选缓存区里已下载的版本，
+                   这里校验 `{download}/{service_name}/{版本}/` 存在后，
+                   由 install 阶段重建 current 软链接指向该版本（包已在节点上）
+    · 回滚动作   → **仅把 current 软链接指回旧版本**，其余文件共用无需动
+                   （新版本内容保留在缓存区，可再次升级时复用）
+
+说明：app/bin/config 三个软链接指向 `current/xxx`，因此改 current 的指向
+即可整体切换版本；子任务（download/install/start）均已完成运行区适配。
 """
 
 import logging
@@ -12,14 +23,25 @@ import subprocess
 import traceback
 from typing import Any, Dict, List, Optional
 
+from utils.app_path import (
+    find_apps_component_dir,
+    find_cache_version_dir,
+    read_state,
+    write_state,
+    read_state_pids,
+    filter_alive_pids,
+    refresh_state_pids,
+    link_to_current,
+    list_cache_versions,
+)
 from utils.config_loader import load_config
-from core.task_utils.download import download_task
 from core.task_utils.install import install_task
 from core.task_utils.start import start_task
 
 # ── 全局配置 ──
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
 
 
 # =============================================================================
@@ -37,8 +59,8 @@ def _build_result(
 ) -> Dict[str, Any]:
     return {
         "success": success,
-        # 顶层状态码（平台约定）: 3=成功 / 13=升级失败
-        "status": 3 if success else 13,
+        # 顶层状态码（平台约定）: 3=已启动 / 7=升级失败
+        "status": 3 if success else 7,
         "task_id": task_id,
         "task_type": "upgrade",
         "message": message,
@@ -88,9 +110,9 @@ def _get_process_start_ticks(pid: int) -> Optional[int]:
         if len(parts) != 2:
             return None
         fields = parts[1].split()
-        if len(fields) < 21:
+        if len(fields) < 20:
             return None
-        return int(fields[20])
+        return int(fields[19])  # starttime, 单位为时钟滴答(通常 100Hz)
     except (OSError, FileNotFoundError, ValueError):
         return None
 
@@ -141,10 +163,15 @@ def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> boo
             if _is_zombie_or_dead(pid):
                 logging.info("[upgrade_task] PID %d 处于僵尸/死亡态，判定为已停止", pid)
                 return False
-            # ── 检查2: PID 回收 → starttime 已变化 ──
+            # ── 检查2: starttime 比对 ──
+            # 读不到 starttime 说明 /proc/{pid}/stat 已不可读（进程正在消失），
+            # 同样判定为已停止；读到但值不同说明 PID 被复用。
             if expected_start_ticks is not None:
                 current_start = _get_process_start_ticks(pid)
-                if current_start is not None and current_start != expected_start_ticks:
+                if current_start is None:
+                    logging.info("[upgrade_task] PID %d 的 starttime 已不可读（进程正在退出），判定为已停止", pid)
+                    return False
+                if current_start != expected_start_ticks:
                     logging.warning(
                         "[upgrade_task] PID %d 启动时间已变化，该 PID 已被复用，原进程已停止",
                         pid,
@@ -192,71 +219,69 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
 # =============================================================================
 
 def _rollback(
-    component_dir: str,
+    service_name: str,
     current_version: str,
     new_version: str,
     was_running: bool,
-    old_bin_dir: str,
     timeout: int,
 ) -> List[str]:
     """
-    回滚升级操作：清理新版本目录 → 恢复 version 文件 → 如旧进程之前运行则重启。
+    回滚升级操作。
+
+    缓存区/运行区分离后，回滚极其轻量：
+        ① 把运行区 current 软链接**指回旧版本**（核心动作，其余文件共用无需动）
+        ② 恢复 state/config.yaml 的 version 字段
+        ③ 若旧进程升级前在运行，则重新启动
+
+    **不再删除新版本目录** —— 新版本内容与旧版本平级共存在缓存区，
+    以后想再升级可直接复用，无需重新下载。
 
     返回回滚步骤描述列表。
     """
     rollback_steps: List[str] = []
 
-    # 1. 删除新版本目录 {new_version}/
-    new_version_dir = os.path.join(component_dir, new_version)
-    if os.path.isdir(new_version_dir):
-        try:
-            shutil.rmtree(new_version_dir)
-            msg = f"已删除新版本目录: {new_version_dir}"
-            logging.info("[upgrade_task][rollback] %s", msg)
-            rollback_steps.append(msg)
-        except Exception as e:
-            msg = f"删除新版本目录失败: {e}"
-            logging.warning("[upgrade_task][rollback] %s", msg)
-            rollback_steps.append(msg)
-    else:
-        rollback_steps.append("新版本目录不存在，无需清理")
+    if not current_version:
+        rollback_steps.append("无旧版本可回滚")
+        return rollback_steps
 
-    # 2. 恢复 version 文件为旧版本号（如旧版本为空则删除 version 文件）
-    version_file = os.path.join(component_dir, "version")
-    try:
-        if current_version:
-            with open(version_file, "w", encoding="utf-8") as vf:
-                vf.write(current_version)
-            msg = f"version 文件已恢复为: {current_version}"
-        else:
-            if os.path.isfile(version_file):
-                os.remove(version_file)
-            msg = "version 文件已删除（旧版本为空）"
+    # 1. 把 current 软链接指回旧版本（app/bin/config 无需重建，它们指向 current/xxx）
+    relink = link_to_current(service_name, current_version)
+    if relink.get("ok"):
+        msg = f"current 软链接已回滚到旧版本: {current_version}"
         logging.info("[upgrade_task][rollback] %s", msg)
+    else:
+        msg = f"回滚软链接失败: {relink.get('error')}"
+        logging.error("[upgrade_task][rollback] %s", msg)
+    rollback_steps.append(msg)
+
+    # 2. 恢复运行状态中的版本号
+    state = read_state(service_name)
+    if state:
+        state["version"] = current_version
+        if write_state(service_name, state):
+            msg = f"运行状态 version 已恢复为: {current_version}"
+            logging.info("[upgrade_task][rollback] %s", msg)
+        else:
+            msg = "运行状态写入失败"
+            logging.warning("[upgrade_task][rollback] %s", msg)
         rollback_steps.append(msg)
-    except Exception as e:
-        msg = f"恢复 version 文件失败: {e}"
-        logging.warning("[upgrade_task][rollback] %s", msg)
-        rollback_steps.append(msg)
+    else:
+        rollback_steps.append("运行状态文件不存在，跳过版本号恢复")
 
     # 3. 如果旧进程之前是运行的，重新启动
     if was_running:
-        ext = ".bat" if os.name == "nt" else ".sh"
-        start_script = os.path.join(old_bin_dir, f"start{ext}")
-        if os.path.isfile(start_script):
-            logging.info("[upgrade_task][rollback] 重新启动旧版本，执行: %s", start_script)
-            restart_exec = _execute_script(start_script, old_bin_dir, min(timeout, 60))
-            if restart_exec["success"]:
-                msg = f"旧版本已重新启动 (exit_code={restart_exec['exit_code']})"
-                logging.info("[upgrade_task][rollback] %s", msg)
-            else:
-                msg = f"旧版本重启失败 (exit_code={restart_exec['exit_code']}), stderr={restart_exec.get('stderr', '')}"
-                logging.error("[upgrade_task][rollback] %s", msg)
-            rollback_steps.append(msg)
+        start_result = start_task({
+            "task_id": "rollback-start",
+            "service_name": service_name,
+            "version": current_version,
+        }, retry=0, timeout=timeout)
+        if _task_success(start_result):
+            msg = "旧版本已重新启动"
+            logging.info("[upgrade_task][rollback] %s", msg)
         else:
-            msg = f"旧版本启动脚本不存在，无法重启: {start_script}"
-            logging.warning("[upgrade_task][rollback] %s", msg)
-            rollback_steps.append(msg)
+            msg = f"旧版本重启失败: {_task_message(start_result)}"
+            logging.error("[upgrade_task][rollback] %s", msg)
+        rollback_steps.append(msg)
     else:
         rollback_steps.append("旧版本未运行，无需重启")
 
@@ -269,42 +294,43 @@ def _rollback(
 
 def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
     """
-    升级服务任务（版本比对 → 停止旧版 → 下载 → 安装 → 启动）。
+    升级服务任务（版本比对 → 校验缓存区已下载版本 → 停止旧版 → 安装 → 启动；**不再下载**）。
 
     参数:
         - task_id:      任务ID（必填）
         - service_name: 服务名称（必填），同时也是组件目录名
-        - download_url: 下载地址（必填）
-        - file_suffix:  文件后缀，如 .zip（必填）
-        - version:      新版本号（必填）
-
-    Nacos 配置从 {service_name}/runtime/config.yaml 读取
-    启动/停止脚本从 bin/ 文件夹读取
+        - version:      新版本号（必填，必须已在缓存区下载过）
+        - download_url / file_suffix: 兼容保留，不再使用
 
     流程:
-        1. 读取 {download}/{service_name}/version 获取当前版本
-        2. 校验新版本号（任务参数 version，必填）
+        1. 从运行区 state/config.yaml 读取当前版本
+        2. 校验参数（task_id / service_name / version 必填；download_url 已不再需要）
         3. 若当前版本 == 新版本 → 返回 "该版本正在使用"
-        4. 若当前版本不同:
-           a. 检查 runtime/pid 是否存在 → 执行 bin/stop 脚本停止旧服务
-           b. 校验进程已销毁 → 删除 pid 文件
-           c. 下载新版本
-           d. 安装新版本
-           e. 启动新版本
+        4. **先校验该版本已在缓存区**（未下载则直接报错返回，此时旧服务未被动过）
+        5. 若当前版本不同，停止旧版本:
+           a. 依 state 的存活 pids 判断是否在运行 → 执行运行区 bin/stop.sh
+           b. 校验进程已销毁 → 清空运行状态
+        6. 安装（rebuild current 软链接指向新版本）
+        7. 启动新版本
+        8. 任一步失败 → 回滚（current 切回旧版本，并尝试恢复运行）
+
+    版本切换只重建 current 软链接，app/bin/config 保持共用。
     """
     task_id = str(parameters.get("task_id", "") or "").strip()
     service_name = str(parameters.get("service_name", "") or "").strip()
     download_url = str(parameters.get("download_url", "") or "").strip()
     file_suffix = str(parameters.get("file_suffix", "") or "").strip()
     version = str(parameters.get("version", "") or "").strip()
+    # 平台应用记录 ID（下载成功后写入新版目录的 config/app.yaml）
+    app_id = str(parameters.get("app_id", "") or "").strip()
 
     # ── 参数校验 ──
+    # 注意：升级不再下载（直接用缓存区已下载的版本），
+    # 所以 download_url / file_suffix 不再是必填（兼容旧调用，传了也不使用）。
     missing: List[str] = []
     for key, val in [
         ("task_id", task_id),
         ("service_name", service_name),
-        ("download_url", download_url),
-        ("file_suffix", file_suffix),
         ("version", version),
     ]:
         if not val:
@@ -323,35 +349,32 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
             error_message="server.download 未配置",
         )
 
-    # ── 组件目录 ──
-    component_dir = os.path.join(_DOWNLOAD_BASE, service_name)
+    if not _APPS_BASE:
+        return _build_result(
+            task_id, False, "config.yaml 中未配置 server.apps 运行区路径",
+            error_type="ConfigMissing",
+            error_message="server.apps 未配置",
+        )
+
+    # ── 运行区组件目录 ──
+    component_dir = find_apps_component_dir(service_name)
     steps: List[Dict[str, Any]] = []
 
-    if not os.path.isdir(component_dir):
+    if not component_dir:
         return _build_result(
-            task_id, False, f"组件目录不存在: {component_dir}",
-            data={"service_name": service_name, "component_dir": component_dir},
-            error_type="FileNotFoundError",
-            error_message=f"组件目录不存在: {component_dir}",
+            task_id, False,
+            f"运行区组件不存在: {os.path.join(_APPS_BASE, service_name)}",
+            data={"service_name": service_name, "apps_dir": _APPS_BASE},
+            error_type="AppsComponentNotFound",
+            error_message=f"运行区未找到组件 {service_name}，请先执行安装任务",
         )
 
     # ── 新版本号来自任务参数 version（必填，缺失已在上方校验拦截）──
     new_version = version
 
-    # ── Step 1: 读取当前版本，比对 ──
-    version_file = os.path.join(component_dir, "version")
-    if os.path.isfile(version_file):
-        try:
-            with open(version_file, "r", encoding="utf-8") as vf:
-                current_version = vf.read().strip()
-        except Exception as e:
-            return _build_result(
-                task_id, False, f"读取 version 文件失败: {e}",
-                data={"service_name": service_name, "component_dir": component_dir},
-                error_type="VersionReadError", error_message=str(e),
-            )
-    else:
-        current_version = ""
+    # ── Step 1: 读取当前版本（来自运行状态文件），比对 ──
+    state = read_state(service_name)
+    current_version = str(state.get("version", "") or "").strip()
 
     logging.info("[upgrade_task] 当前版本: %s, 新版本: %s", current_version or "(无)", new_version)
 
@@ -366,111 +389,103 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
             },
         )
 
-    # ── Step 2: 停止旧版本服务 ──
+    # ── Step 2: 校验「缓存区已下载的版本」（不下载）──
+    # 升级入口（平台侧）只允许选节点缓存区里已下载的版本，所以这里只校验目录存在：
+    # 存在 → 继续（Step 3 停旧版 → Step 4 安装）；不存在 → 直接报错，不再自动下载。
+    # ★ 必须放在「停止旧版本」之前：校验失败时旧服务还没被动过，
+    #   不会出现"把旧版本停了、才发现新版本没下载"导致服务停在那儿起不来的情况。
+    cache_version_dir = find_cache_version_dir(service_name, new_version)
+    if not cache_version_dir:
+        available = list_cache_versions(service_name)
+        steps.append({
+            "step": "check_cache",
+            "success": False,
+            "message": f"缓存区未找到版本 {new_version}",
+        })
+        return _build_result(
+            task_id, False,
+            f"版本 {new_version} 未下载到节点，请先执行「下载」任务",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "new_version": new_version,
+                "available_versions": available,
+                "steps": steps,
+            },
+            error_type="VersionNotDownloaded",
+            error_message=f"缓存区中未找到版本 {new_version}，已下载的版本: {available or '无'}",
+        )
+    steps.append({
+        "step": "check_cache",
+        "success": True,
+        "message": f"使用缓存区已下载版本（跳过下载）: {cache_version_dir}",
+    })
+    logging.info("[upgrade_task] 跳过下载，直接安装缓存区版本: %s", cache_version_dir)
+
+    # ── Step 3: 停止旧版本服务 ──
+    # 判据与 stop_task 一致：state.runtime 为真且存在存活进程
     was_running = False   # 回滚标记：旧进程是否原本在运行
-    old_bin_dir_for_rollback = ""  # 回滚所需：旧版本 bin 目录
     if current_version:
-        old_runtime_dir = os.path.join(component_dir, current_version, "runtime")
-        old_pid_file = os.path.join(old_runtime_dir, "pid")
-        old_bin_dir = os.path.join(component_dir, current_version, "bin")
-        old_bin_dir_for_rollback = old_bin_dir
+        alive_pids = filter_alive_pids(read_state_pids(service_name), service_name)
+        pid_before = ",".join(str(p) for p in alive_pids)
 
-        pid_list = []
-        pid_before = ""
-        if os.path.isfile(old_pid_file):
-            try:
-                with open(old_pid_file, "r", encoding="utf-8") as pf:
-                    content = pf.read().strip()
-                logging.info("[upgrade_task] 检测到 PID 文件内容: %s", content)
-                if content:
-                    for line in content.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            pid_list.append(int(line))
-                        except ValueError:
-                            pass
-            except Exception as e:
-                logging.warning("[upgrade_task] 读取旧 PID 文件失败: %s", e)
-            pid_before = ",".join(str(p) for p in pid_list)
-
-            # 执行 bin/stop 脚本
+        if alive_pids:
+            # 执行运行区的 bin/stop.sh（经 current/bin 软链接）
             ext = ".bat" if os.name == "nt" else ".sh"
-            stop_script = os.path.join(old_bin_dir, f"stop{ext}")
+            bin_dir = os.path.join(component_dir, "bin")
+            stop_script = os.path.join(bin_dir, f"stop{ext}")
 
-            if os.path.isfile(stop_script):
-                logging.info("[upgrade_task] 执行停止脚本: %s", stop_script)
-                stop_exec = _execute_script(stop_script, old_bin_dir, min(timeout, 60))
-                logging.info(
-                    "[upgrade_task] 停止脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
-                    stop_exec["exit_code"], stop_exec.get("stdout", ""), stop_exec.get("stderr", ""),
-                )
-                steps.append({
-                    "step": "stop_old",
-                    "success": stop_exec["success"],
-                    "message": "停止旧版本服务" + ("成功" if stop_exec["success"] else f"失败 (exit_code={stop_exec['exit_code']})"),
-                    "data": {
-                        "pid_before": pid_before,
-                        "exit_code": stop_exec["exit_code"],
-                        "stdout": stop_exec.get("stdout", ""),
-                        "stderr": stop_exec.get("stderr", ""),
-                    },
-                })
-
-                # ── 校验进程是否已销毁（多 PID 逐一检查）──
-                if pid_list:
-                    # 停止前记录各 PID 的 starttime，防止 kill 后 PID 被回收复用导致误判
-                    pid_start_ticks = {p: _get_process_start_ticks(p) for p in pid_list}
-                    still_alive = []
-                    for pid_int in pid_list:
-                        if _process_exists(pid_int, pid_start_ticks.get(pid_int)):
-                            still_alive.append(str(pid_int))
-                    if still_alive:
-                        return _build_result(
-                            task_id, False, f"停止旧版本失败: 进程 {', '.join(still_alive)} 仍然存活",
-                            data={
-                                "service_name": service_name,
-                                "current_version": current_version,
-                                "new_version": new_version,
-                                "pid": pid_before,
-                                "process_still_alive": True,
-                                "steps": steps,
-                            },
-                            error_type="ProcessStillAlive",
-                            error_message=f"PID {', '.join(still_alive)} 进程仍然存活，无法升级",
-                        )
-                    else:
-                        logging.info("[upgrade_task] 旧进程 %s 已销毁", pid_before)
-                        was_running = True  # 标记旧进程曾运行，回滚时需要重启
-                else:
-                    # PID 文件存在但无有效 PID，保守起见标记为曾运行
-                    logging.info("[upgrade_task] PID 文件无有效 PID，跳过进程校验")
-                    was_running = True
-
-                # ── 删除旧 PID 文件 ──
-                if os.path.isfile(old_pid_file):
-                    try:
-                        os.remove(old_pid_file)
-                        logging.info("[upgrade_task] 旧 PID 文件已删除: %s", old_pid_file)
-                    except Exception as e:
-                        logging.warning("[upgrade_task] 删除旧 PID 文件失败: %s", e)
-            else:
-                logging.error("[upgrade_task] 停止脚本不存在: %s，无法停止运行中的旧版本", stop_script)
+            if not os.path.isfile(stop_script):
                 return _build_result(
-                    task_id, False, f"停止脚本不存在，无法停止运行中的旧版本 {current_version}: {stop_script}",
-                    data={
-                        "service_name": service_name,
-                        "current_version": current_version,
-                        "new_version": new_version,
-                        "pid": pid_before,
-                        "steps": steps,
-                    },
+                    task_id, False,
+                    f"停止脚本不存在，无法停止运行中的旧版本 {current_version}: {stop_script}",
+                    data={"service_name": service_name,
+                          "current_version": current_version,
+                          "new_version": new_version,
+                          "pids": alive_pids, "steps": steps},
                     error_type="StopScriptNotFound",
                     error_message=f"停止脚本不存在: {stop_script}",
                 )
+
+            logging.info("[upgrade_task] 执行停止脚本: %s", stop_script)
+            stop_exec = _execute_script(stop_script, bin_dir, min(timeout, 60))
+            logging.info(
+                "[upgrade_task] 停止脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+                stop_exec["exit_code"], stop_exec.get("stdout", ""), stop_exec.get("stderr", ""),
+            )
+            steps.append({
+                "step": "stop_old",
+                "success": stop_exec["success"],
+                "message": "停止旧版本服务" + ("成功" if stop_exec["success"] else f"失败 (exit_code={stop_exec['exit_code']})"),
+                "data": {"pid_before": pid_before,
+                         "exit_code": stop_exec["exit_code"],
+                         "stdout": stop_exec.get("stdout", ""),
+                         "stderr": stop_exec.get("stderr", "")},
+            })
+
+            # ── 校验进程是否已销毁（多 PID 逐一检查，starttime 防 PID 复用误判）──
+            pid_start_ticks = {p: _get_process_start_ticks(p) for p in alive_pids}
+            still_alive = [str(p) for p in alive_pids
+                           if _process_exists(p, pid_start_ticks.get(p))]
+            if still_alive:
+                return _build_result(
+                    task_id, False, f"停止旧版本失败: 进程 {', '.join(still_alive)} 仍然存活",
+                    data={"service_name": service_name,
+                          "current_version": current_version,
+                          "new_version": new_version,
+                          "pids": alive_pids, "process_still_alive": True,
+                          "steps": steps},
+                    error_type="ProcessStillAlive",
+                    error_message=f"PID {', '.join(still_alive)} 进程仍然存活，无法升级",
+                )
+
+            logging.info("[upgrade_task] 旧进程 %s 已销毁", pid_before)
+            was_running = True   # 标记旧进程曾运行，回滚时需要重启
+
+            # 清空运行状态（pids/processes 清空，runtime 置 false）
+            refresh_state_pids(service_name, [], [])
         else:
-            logging.info("[upgrade_task] 未找到 PID 文件，旧版本可能未运行，跳过停止步骤")
+            logging.info("[upgrade_task] 无存活进程，旧版本未运行，跳过停止步骤")
             steps.append({
                 "step": "stop_old",
                 "success": True,
@@ -484,64 +499,13 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
             "message": "无旧版本，跳过停止",
         })
 
-    # ── 销毁旧 version 文件，避免 download_task 读旧版本号误判为已下载 ──
-    if current_version:
-        version_file = os.path.join(component_dir, "version")
-        if os.path.isfile(version_file):
-            try:
-                os.remove(version_file)
-                logging.info("[upgrade_task] 已删除 version 文件: %s", version_file)
-                steps.append({
-                    "step": "cleanup_old_version_file",
-                    "success": True,
-                    "message": f"已删除旧 version 文件，原版本号: {current_version}",
-                })
-            except Exception as e:
-                logging.warning("[upgrade_task] 删除 version 文件失败: %s", e)
-                steps.append({
-                    "step": "cleanup_old_version_file",
-                    "success": False,
-                    "message": f"删除 version 文件失败: {e}",
-                })
-
-    # ── Step 3: 下载新版本 ──
-    logging.info("[upgrade_task] 开始下载新版本: %s", new_version)
-    download_result = download_task({
-        "task_id": task_id,
-        "download_url": download_url,
-        "file_name": service_name,
-        "file_suffix": file_suffix,
-        "version": new_version,
-    }, retry=retry, timeout=timeout)
-
-    download_ok = _task_success(download_result)
-    steps.append({
-        "step": "download",
-        "success": download_ok,
-        "message": _task_message(download_result),
-        "data": download_result.get("data", {}),
-    })
-
-    if not download_ok:
-        rollback_info = _rollback(component_dir, current_version, new_version, was_running, old_bin_dir_for_rollback, timeout)
-        return _build_result(
-            task_id, False, f"下载新版本失败，已回滚: {_task_message(download_result)}",
-            data={
-                "service_name": service_name,
-                "current_version": current_version,
-                "new_version": new_version,
-                "steps": steps,
-                "rollback": rollback_info,
-            },
-            error_type="UpgradeDownloadFailed",
-            error_message=_task_message(download_result),
-        )
-
     # ── Step 4: 安装新版本 ──
+    # install 会重建 current 软链接指向新版本（app/bin/config 保持共存共用）
     logging.info("[upgrade_task] 开始安装新版本")
     install_result = install_task({
         "task_id": task_id,
         "file_name": service_name,
+        "version": new_version,
     }, retry=retry, timeout=timeout)
 
     install_ok = _task_success(install_result)
@@ -553,7 +517,7 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
     })
 
     if not install_ok:
-        rollback_info = _rollback(component_dir, current_version, new_version, was_running, old_bin_dir_for_rollback, timeout)
+        rollback_info = _rollback(service_name, current_version, new_version, was_running, timeout)
         return _build_result(
             task_id, False, f"安装新版本失败，已回滚: {_task_message(install_result)}",
             data={
@@ -567,11 +531,12 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
             error_message=_task_message(install_result),
         )
 
-    # ── Step 5: 启动新版本（start_task 从 bin/ 目录读取脚本）──
+    # ── Step 5: 启动新版本（start_task 从运行区 bin/ 读取脚本）──
     logging.info("[upgrade_task] 启动新版本服务")
     start_result = start_task({
         "task_id": task_id,
         "service_name": service_name,
+        "version": new_version,
     }, retry=retry, timeout=timeout)
 
     start_ok = _task_success(start_result)
@@ -584,7 +549,7 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
     })
 
     if not start_ok:
-        rollback_info = _rollback(component_dir, current_version, new_version, was_running, old_bin_dir_for_rollback, timeout)
+        rollback_info = _rollback(service_name, current_version, new_version, was_running, timeout)
         return _build_result(
             task_id, False, f"启动新版本失败，已回滚: {_task_message(start_result)}",
             data={

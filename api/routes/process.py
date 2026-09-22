@@ -1,5 +1,12 @@
 """
 进程查询相关的 API 路由
+
+【改造说明】
+原实现从「下载区」读取 version 文件与 {version}/runtime/pid。
+缓存区/运行区分离后：
+    · 版本号 → 运行区 {apps}/{service_name}/state/config.yaml 的 version 字段
+    · 进程号 → 同一状态文件的 pids 数组
+    · runtime 目录 → {apps}/{service_name}/runtime/
 """
 import logging
 import os
@@ -13,6 +20,15 @@ import yaml
 from fastapi import APIRouter, HTTPException, Query
 
 from core.process.process_info import _process_exists
+from utils.app_path import (
+    SUB_DIR_PLUGIN,
+    SUB_DIR_XKT,
+    resolve_sub_dir,
+    read_state,
+    read_state_pids,
+    get_state_file,
+    find_apps_component_dir,
+)
 from utils.config_loader import load_config
 from utils.util import get_ip
 
@@ -20,60 +36,50 @@ router = APIRouter()
 
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 平台下发的 type → 应用类别层：1=普通/虚拟机（无分层）、3=显控台、4=插件
+_SUB_DIR_BY_TYPE = {3: SUB_DIR_XKT, 4: SUB_DIR_PLUGIN}
 
 
-def _read_version(service_dir: str) -> str:
-    """读取服务目录下的 version 文件"""
-    version_file = os.path.join(service_dir, "version")
-    if not os.path.isfile(version_file):
-        raise HTTPException(status_code=404, detail=f"version 文件不存在: {version_file}")
+def _read_version(service_name: str, sub_dir: str = "") -> str:
+    """
+    读取服务当前版本号。
 
-    try:
-        with open(version_file, "r", encoding="utf-8") as f:
-            version = f.read().strip()
-    except Exception:
-        raise HTTPException(status_code=500, detail="读取 version 文件失败")
+    来源：运行区 {apps}[/{sub_dir}]/{service_name}/state/config.yaml 的 version 字段
+    """
+    state = read_state(service_name, sub_dir)
+    if not state:
+        raise HTTPException(
+            status_code=404,
+            detail=f"运行状态文件不存在: {get_state_file(service_name, sub_dir)}")
 
+    version = str(state.get("version", "") or "").strip()
     if not version:
-        raise HTTPException(status_code=404, detail="version 内容为空")
+        raise HTTPException(status_code=404, detail="运行状态中 version 字段为空")
 
     return version
 
 
-def _read_pids(runtime_dir: str) -> list:
-    """读取 runtime/pid 文件，支持多行 PID，返回有效的 PID 整数列表"""
-    pid_file = os.path.join(runtime_dir, "pid")
-    if not os.path.isfile(pid_file):
-        return []
+def _read_pids(service_name: str, sub_dir: str = "") -> list:
+    """
+    读取服务的进程号列表。
 
-    try:
-        with open(pid_file, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
-    except Exception:
-        return []
-
-    pids = []
-    for line in lines:
-        try:
-            pids.append(int(line))
-        except ValueError:
-            logging.warning("[_read_pids] 非法 PID 行，已忽略: %s", line)
-    return pids
+    来源：运行区 {apps}[/{sub_dir}]/{service_name}/state/config.yaml 的 pids 数组
+    """
+    return read_state_pids(service_name, sub_dir)
 
 
-def _read_allowed_names(runtime_dir: str) -> list:
-    """读取 runtime/config.yaml 中的 name 字段，返回允许的进程名列表"""
-    config_path = os.path.join(runtime_dir, "config.yaml")
-    if not os.path.isfile(config_path):
+def _read_allowed_names(service_name: str, sub_dir: str = "") -> list:
+    """
+    读取运行状态中的进程名列表（作为进程名白名单）。
+
+    来源：运行区 state/config.yaml 的 processes 数组
+    """
+    state = read_state(service_name, sub_dir)
+    if not state:
         return []
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception:
-        return []
-    if not isinstance(cfg, dict):
-        return []
-    names = cfg.get("name", [])
+    names = state.get("processes", [])
     if isinstance(names, str):
         return [names]
     return names if isinstance(names, list) else []
@@ -240,37 +246,45 @@ async def query_process_by_service(
     根据服务名称查询进程信息。
 
     流程:
-        1. 在 download 目录下定位服务文件夹
-        2. 读取 version 文件获取版本号
-        3. 读取 {version}/runtime/pid 获取 PID（支持多行多 PID）
-        4. 检查各 PID 是否存活
-        5. 获取进程名、CPU、内存、IO、端口等信息，自动去重
+        1. 在运行区定位服务目录 {apps}/{service_name}
+        2. 读取 state/config.yaml 获取版本号与 pids 数组
+        3. 检查各 PID 是否存活
+        4. 获取进程名、CPU、内存、IO、端口等信息，自动去重
 
     type 参数:
-        type=1（默认）: 普通服务，路径 download/{service_name}
-        type=3: 显控台服务，路径 download/displayConsole/{service_name}
+        type=1（默认）: 普通服务（虚拟机），路径 {apps}/{service_name}
+        type=3: 显控台服务，路径 {apps}/displayConsole/{service_name}
+        type=4: 插件服务，路径   {apps}/plugin/{service_name}
 
     返回:
         进程名、PID、是否存活、CPU、内存、IO、端口等信息
     """
-    if not _DOWNLOAD_BASE:
-        raise HTTPException(status_code=500, detail="config.yaml 中未配置 server.download")
+    if not _APPS_BASE:
+        raise HTTPException(status_code=500, detail="config.yaml 中未配置 server.apps")
 
-    base_path = os.path.join(_DOWNLOAD_BASE, "displayConsole") if type == 3 else _DOWNLOAD_BASE
+    # 先按平台下发的 type 判定类别层；type 与目录不符（或未下发）时自动探测，
+    # 避免显控台/插件服务被误判成"运行区服务目录不存在"
+    sub_dir = _SUB_DIR_BY_TYPE.get(type) or ""
+    if sub_dir and not os.path.isdir(os.path.join(_APPS_BASE, sub_dir, service_name)):
+        sub_dir = ""
+    if not sub_dir:
+        sub_dir = resolve_sub_dir(service_name, roots=[_APPS_BASE])
+
+    base_path = os.path.join(_APPS_BASE, sub_dir) if sub_dir else _APPS_BASE
     service_dir = os.path.join(base_path, service_name)
     if not os.path.isdir(service_dir):
-        raise HTTPException(status_code=404, detail=f"服务目录不存在: {service_dir}")
+        raise HTTPException(status_code=404, detail=f"运行区服务目录不存在: {service_dir}")
 
-    # 读取版本号
-    version = _read_version(service_dir)
+    # 读取版本号（来自 state/config.yaml）
+    version = _read_version(service_name, sub_dir)
 
-    # 定位 runtime 目录
-    runtime_dir = os.path.join(service_dir, version, "runtime")
+    # runtime 目录（resources.txt 等运行态产物落点）
+    runtime_dir = os.path.join(service_dir, "runtime")
     if not os.path.isdir(runtime_dir):
         raise HTTPException(status_code=404, detail=f"runtime 目录不存在: {runtime_dir}")
 
-    # 读取 PID（支持多行多 PID）
-    pids = _read_pids(runtime_dir)
+    # 读取 PID（来自 state/config.yaml 的 pids 数组）
+    pids = _read_pids(service_name, sub_dir)
 
     # Step 1: 展开所有进程 PID（根 + 子进程），用于批量 IO 采样
     all_pids = _collect_all_pids(pids)
@@ -293,8 +307,8 @@ async def query_process_by_service(
                     seen_pids.add(child["pid"])
                     processes.append(child)
 
-    # Step 4: 按 config.yaml 中的 name 字段过滤，只保留匹配的进程
-    allowed_names = _read_allowed_names(runtime_dir)
+    # Step 4: 按运行状态中的 processes 字段过滤，只保留匹配的进程
+    allowed_names = _read_allowed_names(service_name, sub_dir)
     if allowed_names:
         processes = [
             p for p in processes

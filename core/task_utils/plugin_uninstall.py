@@ -1,20 +1,39 @@
 """
-xkt 插件卸载任务模块
+卸载服务任务模块
 
-与 uninstall.py 业务逻辑对齐，唯一区别：路径多一层 plugin/
-即组件目录为 {server.download}/plugin/{service_name}/{version}/bin/uninstall.sh
+与 uninstall.py 结构完全对齐，唯一区别：路径多一层 plugin/（由 _SUB_DIR 承载）。
+
+在「运行区」定位组件并执行其 bin/uninstall.sh 卸载脚本。
+
+缓存区/运行区分离后：
+    · 组件定位 → {server.apps}/{service_name}/（install 建立的软链接结构）
+    · 版本号   → state/config.yaml 的 version 字段（原为 {component}/version 文件）
+    · 运行检查 → 已运行则拒绝卸载（读 state 的 runtime 与 pids）
+    · 卸载收尾 → 清空状态文件（pids=[] / processes=[] / runtime=false）
 """
 
 import logging
 import os
+import shutil
 import subprocess
 from typing import Any, Dict, Optional
 
+from utils.app_path import (
+    SUB_DIR_PLUGIN,
+    find_apps_component_dir,
+    read_state,
+    read_state_pids,
+    filter_alive_pids,
+    is_running,
+)
 from utils.config_loader import load_config
 
 # ── 全局配置 ──
 _CONFIG = load_config()
-_DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 本模块处理的应用类别（决定路径中的分层目录）
+_SUB_DIR = SUB_DIR_PLUGIN
 
 
 # =============================================================================
@@ -42,7 +61,7 @@ def _build_result(
             {}
             if success
             else {
-                "error_type": error_type or "PluginUninstallTaskError",
+                "error_type": error_type or "UninstallTaskError",
                 "error_message": error_message or message,
                 "traceback": tb,
             }
@@ -50,65 +69,52 @@ def _build_result(
     }
 
 
-def _resolve_paths(service_name: str, sub_dir: str = "plugin") -> tuple:
+def _resolve_paths(service_name: str) -> tuple:
     """
-    根据 service_name 解析显控组件路径。
+    在运行区解析组件路径。
 
     返回:
         (error, component_dir, version, bin_dir)
         - 出错: (error_result, "", "", "")
-        - 正常: (None, component_dir, version, bin_dir)
+        - 正常: (None, 运行区组件目录, version, 运行区 bin 目录)
     """
-    if not _DOWNLOAD_BASE:
+    if not _APPS_BASE:
         return (
             _build_result(
-                "", False, "config.yaml 中未配置 server.download",
+                "", False, "config.yaml 中未配置 server.apps 运行区路径",
                 error_type="ConfigMissing",
-                error_message="server.download 未配置",
+                error_message="server.apps 未配置",
             ),
             "", "", "",
         )
 
-    component_dir = os.path.join(_DOWNLOAD_BASE, sub_dir, service_name)
-    if not os.path.isdir(component_dir):
+    # 在运行区定位组件目录
+    component_dir = find_apps_component_dir(service_name, _SUB_DIR)
+    if not component_dir:
         return (
             _build_result(
-                "", False, f"组件目录不存在: {component_dir}",
-                error_type="FileNotFoundError",
-                error_message=f"组件目录不存在: {component_dir}",
+                "", False, f"运行区组件不存在: {os.path.join(_APPS_BASE, _SUB_DIR, service_name)}",
+                error_type="AppsComponentNotFound",
+                error_message=f"运行区未找到组件 {service_name}，无需卸载",
             ),
             "", "", "",
         )
 
-    # 读取 version
-    version_file = os.path.join(component_dir, "version")
-    if not os.path.isfile(version_file):
-        return (
-            _build_result(
-                "", False, f"version 文件不存在: {version_file}",
-                error_type="FileNotFoundError",
-                error_message="未找到 version 文件，请确认组件已下载",
-            ),
-            "", "", "",
-        )
-    try:
-        with open(version_file, "r", encoding="utf-8") as vf:
-            version = vf.read().strip()
-    except Exception as e:
-        return (
-            _build_result("", False, f"读取 version 失败: {e}",
-                          error_type="VersionReadError", error_message=str(e)),
-            "", "", "",
-        )
+    # 版本号来自运行状态文件
+    state = read_state(service_name, _SUB_DIR)
+    version = str(state.get("version", "") or "").strip()
     if not version:
         return (
-            _build_result("", False, "version 文件为空",
-                          error_type="VersionEmpty", error_message="version 文件为空"),
+            _build_result(
+                "", False, "运行状态中 version 字段为空",
+                error_type="VersionMissing",
+                error_message="state/config.yaml 中未记录版本号，无法定位卸载脚本",
+            ),
             "", "", "",
         )
 
-    # bin 目录: {component_dir}/{version}/bin/
-    bin_dir = os.path.join(component_dir, version, "bin")
+    # bin 目录：{apps}/{service_name}/bin（指向 current/bin 的软链接）
+    bin_dir = os.path.join(component_dir, "bin")
     if not os.path.isdir(bin_dir):
         return (
             _build_result(
@@ -174,21 +180,21 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
 
 def plugin_uninstall_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
     """
-    插件卸载任务（执行 bin/uninstall.sh 脚本）。
+    卸载服务任务（执行运行区的 bin/uninstall.sh 脚本）。
 
     参数:
         - task_id:      任务ID（必填）
-        - service_name: 服务名称（必填），同时也是 plugin 下的组件目录名
+        - service_name: 服务名称（必填），同时也是组件目录名
 
     流程:
-        1. 根据 service_name 定位 plugin 组件目录，读取 version
-        2. 检查 {version}/runtime/pid 是否存在
-           - 存在 → 返回失败，提示先停止服务
-           - 不存在 → 执行 bin/uninstall.sh 卸载脚本
+        1. 在运行区 {server.apps}/{service_name}/ 定位组件，从 state 读版本号
+        2. 检查服务是否仍在运行（state.runtime 为真且存在存活 pid）
+           - 在运行 → 返回失败，提示先停止服务
+           - 已停止 → 执行 bin/uninstall.sh 卸载脚本
+        3. 卸载成功 → 清空运行状态（pids=[] / processes=[] / runtime=false）
     """
     task_id = str(parameters.get("task_id", "") or "").strip()
     service_name = str(parameters.get("service_name", "") or "").strip()
-    sub_dir = str(parameters.get("sub_dir", "") or "plugin").strip()
 
     # ── 参数校验 ──
     if not task_id:
@@ -199,7 +205,7 @@ def plugin_uninstall_task(parameters: Dict[str, Any], retry: int = 0, timeout: i
                              error_type="ParameterMissing", error_message="service_name 缺失")
 
     # ── 路径解析 ──
-    error, component_dir, version, bin_dir = _resolve_paths(service_name, sub_dir)
+    error, component_dir, version, bin_dir = _resolve_paths(service_name)
     if error:
         error["task_id"] = task_id
         error["data"] = {
@@ -210,10 +216,6 @@ def plugin_uninstall_task(parameters: Dict[str, Any], retry: int = 0, timeout: i
 
     logging.info("[plugin_uninstall_task] 组件目录: %s, 版本: %s, bin目录: %s", component_dir, version, bin_dir)
 
-    # ── 检查 runtime/pid 是否存在 ──
-    runtime_dir = os.path.join(component_dir, version, "runtime")
-    pid_file = os.path.join(runtime_dir, "pid")
-
     base_data = {
         "service_name": service_name,
         "version": version,
@@ -221,23 +223,24 @@ def plugin_uninstall_task(parameters: Dict[str, Any], retry: int = 0, timeout: i
         "bin_dir": bin_dir,
     }
 
-    if os.path.isfile(pid_file):
-        pid_value = ""
-        try:
-            with open(pid_file, "r", encoding="utf-8") as pf:
-                pid_value = pf.read().strip()
-        except Exception:
-            pass
+    # ── 检查服务是否仍在运行 ──
+    # 判据：state.runtime == true 且 pids 中尚有存活进程
+    # （仅看 runtime 字段不够，可能因异常退出而残留 true）
+    alive_pids = filter_alive_pids(read_state_pids(service_name, _SUB_DIR), service_name)
+    if is_running(service_name, _SUB_DIR) and alive_pids:
+        pid_value = ",".join(str(p) for p in alive_pids)
+        logging.error("[plugin_uninstall_task] 服务仍在运行，拒绝卸载: pids=%s", alive_pids)
         return _build_result(
             task_id, False, f"服务仍在运行 (PID: {pid_value})，请先执行停止任务",
             data={
                 **base_data,
                 "status": "uninstall_blocked",
+                "pids": alive_pids,
                 "pid": pid_value,
-                "pid_file_exists": True,
+                "runtime": True,
             },
             error_type="ServiceRunning",
-            error_message=f"PID 文件存在 ({pid_value})，服务可能仍在运行，请先停止",
+            error_message=f"进程 {pid_value} 仍在运行，请先执行停止任务",
         )
 
     # ── 定位 uninstall.sh 脚本 ──
@@ -272,9 +275,40 @@ def plugin_uninstall_task(parameters: Dict[str, Any], retry: int = 0, timeout: i
             error_message=exec_result.get("stderr", "") or f"脚本退出码: {exec_result['exit_code']}",
         )
 
+    # ── 清理运行区与运行状态 ──
+    # 卸载后组件不应再留在运行区（缓存区保留，可重新安装）
+    cleared = []
+    try:
+        # 逐个删除软链接（先 unlink，避免 rmtree 追进缓存区真实目录）
+        for name in ("current", "app", "bin", "config"):
+            link = os.path.join(component_dir, name)
+            if os.path.islink(link):
+                os.unlink(link)
+                cleared.append(name)
+            elif os.path.isdir(link):
+                shutil.rmtree(link, ignore_errors=True)
+                cleared.append(name)
+
+        # 删除 runtime / state 目录
+        for d in ("runtime", "state"):
+            p = os.path.join(component_dir, d)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+                cleared.append(d)
+
+        # 组件目录若已空则一并删除
+        if os.path.isdir(component_dir) and not os.listdir(component_dir):
+            os.rmdir(component_dir)
+            cleared.append("(组件目录)")
+
+        logging.info("[plugin_uninstall_task] 运行区已清理: %s", cleared)
+    except Exception as e:
+        logging.warning("[plugin_uninstall_task] 清理运行区失败（不影响卸载结果）: %s", e)
+
     return _build_result(task_id, True, "卸载完成", data={
         **base_data,
         "status": "uninstalled",
+        "cleared": cleared,
         "exit_code": exec_result["exit_code"],
     })
 
@@ -291,13 +325,13 @@ if __name__ == "__main__":
 
     result = plugin_uninstall_task(
         {
-            "task_id": "test-xkt-uninstall-001",
-            "service_name": "nginx-ruoyi",
+            "task_id": "test-uninstall-001",
+            "service_name": "hellogitworld-master",
         },
     )
 
     print("\n" + "=" * 60)
-    print("  插件卸载任务结果")
+    print("  卸载任务结果")
     print("=" * 60)
     print(f"  task_id : {result.get('task_id', '')}")
     print(f"  成功    : {result['success']}")

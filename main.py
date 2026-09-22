@@ -154,7 +154,7 @@ def main():
         )
         task_thread.start()
 
-        # ========== 节点资源采集线程（始终启用，写入 download/node/runtime/resources.txt） ==========
+        # ========== 节点资源采集线程（始终启用，写入 {server.apps}/node/runtime/resources.txt） ==========
         logger.info("启动节点资源采集线程...")
         def _node_resource_loop():
             """每 10 秒采集节点 CPU/内存/IO 资源"""
@@ -250,6 +250,35 @@ def main():
             logger.info("启动进程信息上报线程（每 10 秒）...")
             report_thread = threading.Thread(target=_process_report_loop, daemon=True)
             report_thread.start()
+
+            def _runtime_state_clean_loop():
+                """
+                每 60 秒执行一次运行状态兜底校验。
+
+                主链路由进程上报线程负责（采集时会顺带清理死 pid）；
+                本线程作为兜底：若上报线程异常/卡住，仍能纠正
+                state/config.yaml 中「runtime=true 但进程已退出」的错误状态。
+                """
+                from core.process import clean_dead_runtimes
+
+                _clean_interval = 60
+                while True:
+                    try:
+                        result = clean_dead_runtimes()
+                        if result.get("corrected", 0) > 0:
+                            logger.info(
+                                "运行状态兜底纠正完成: 检查=%d 纠正=%d",
+                                result.get("checked", 0), result.get("corrected", 0)
+                            )
+                        for err in result.get("errors", [])[:3]:
+                            logger.warning(f"  兜底纠正异常: {err}")
+                    except Exception as e:
+                        logger.warning(f"运行状态兜底检查异常: {e}")
+                    time.sleep(_clean_interval)
+
+            logger.info("启动运行状态兜底校验线程（每 60 秒）...")
+            clean_thread = threading.Thread(target=_runtime_state_clean_loop, daemon=True)
+            clean_thread.start()
 
             def _nacos_register_loop():
                 """每 30 秒执行 Nacos 服务发现并注册"""
@@ -362,9 +391,16 @@ def main():
                     logger.error(f"检测 Harbor 仓库异常: {e}")
                     return False
 
-            if not _check_harbor_running():
-                logger.error("没有检测到 harbor 仓库，HARBOR 类型功能不可用，Agent 退出")
-                return
+            # 说明：以前这里检测不到 Harbor 会直接 return（Agent 整体退出），
+            # 结果是「节点没装 Harbor → Agent 退出 → 平台推的安装任务永远没人消费」死锁。
+            # 现改为：未安装时只告警并跳过 Helm 同步，Agent 继续运行并等待安装任务；
+            # 等平台安装完成、Harbor 起来后，同步线程会自行生效（下方循环内重试）。
+            _harbor_ready = _check_harbor_running()
+            if not _harbor_ready:
+                logger.warning(
+                    "没有检测到 harbor 仓库，HARBOR 上报功能暂不可用；"
+                    "Agent 继续运行，等待平台下发 Harbor 安装任务"
+                )
 
             def _helm_sync_loop():
                 """每 30 秒同步 Helm release 列表到 Redis"""
@@ -381,6 +417,22 @@ def main():
             logger.info("启动 Helm release 同步线程（每 30 秒）...")
             helm_thread = threading.Thread(target=_helm_sync_loop, daemon=True)
             helm_thread.start()
+
+            # 启动 K8s 任务循环，用于接收 Harbor/Helm 安装与卸载任务。
+            # 必要：这些任务走 Redis 队列 agent:k8s:{ip}，只有该循环在跑才能消费。
+            #
+            # ⚠️ 去重：HARBOR 与 KUBERNETES 共用同一个队列，若两个类型都启用，
+            # 下面 KUBERNETES 段还会再启一个循环 → 两个消费者抢同一队列，
+            # 任务可能被错误的一方取走。故此处仅在「未启用 KUBERNETES」时启动，
+            # 由 KUBERNETES 段那一个循环统一消费（它同样能处理 harbor 任务）。
+            if "KUBERNETES" not in _ENABLED_TYPES:
+                from core.k8s_agent import k8s_task_loop as _harbor_task_loop
+                logger.info("启动 Harbor 任务处理线程（安装/卸载）...")
+                threading.Thread(
+                    target=_harbor_task_loop, kwargs={"timeout": 10}, daemon=True
+                ).start()
+            else:
+                logger.info("KUBERNETES 已启用，Harbor 任务将由 K8s 任务循环统一处理")
 
         # ========== KUBERNETES：K8s 任务处理 ==========
         if "KUBERNETES" in _ENABLED_TYPES:

@@ -55,6 +55,12 @@ _INTERFACE_DEREGISTER_URL = _INTERFACE.get("deregisterUrl", "")
 # ── server 配置 ──
 _SERVER_CFG = _CONFIG.get("server", {})
 
+# 注：以下 server/interface 相关变量当前在 download 阶段已不再使用
+#（下载区只做缓存，不再生成 application.yml），
+# 保留定义是因为 install 阶段生成组件描述文件时仍需同样的取值口径，
+# 便于后续整体迁移到独立的「运行区」构建逻辑中。
+
+
 
 
 # 默认下载目录（config.yaml 中 server.download 字段）
@@ -127,6 +133,172 @@ def _login_app_store() -> str:
         return ""
 
 
+# =============================================================================
+# 应用包元信息（config/app.yaml）
+# =============================================================================
+
+# 应用包内元信息文件：{包内任意位置}/config/app.yaml
+META_DIR = "config"
+META_FILE = "app.yaml"
+
+# 标准结构中的三个业务目录（解压归位时按这些名字识别）
+STD_DIRS = ("bin", "app", "config")
+
+# 兼容旧名（模块内沿用下划线前缀的短名）
+_META_DIR = META_DIR
+_META_FILE = META_FILE
+_STD_DIRS = STD_DIRS
+
+
+def read_app_meta(extract_dir: str) -> Dict[str, str]:
+    """
+    在解压目录中定位 config/app.yaml，读出应用名与版本号。
+
+    搜索策略（按优先级）：
+      1. 解压根目录下的 config/app.yaml（标准结构解压后被铺平的情形）
+      2. 任意深度的 */config/app.yaml（包内带多层或非标准顶层目录的情形）
+    只取最浅的那一个，避免命中嵌套在 app/ 里的同名文件。
+
+    参数:
+        extract_dir: 解压目标目录
+
+    返回:
+        {"name": 应用名, "version": 版本号}；未找到或字段缺失返回 {}
+    """
+    candidates = []
+
+    # 1) 根目录直接命中
+    root_meta = os.path.join(extract_dir, _META_DIR, _META_FILE)
+    if os.path.isfile(root_meta):
+        candidates.append((0, root_meta))
+
+    # 2) 任意深度的 config/app.yaml，记录深度用于取最浅
+    try:
+        for cur, dirs, files in os.walk(extract_dir):
+            if _META_DIR in dirs:
+                p = os.path.join(cur, _META_DIR, _META_FILE)
+                if os.path.isfile(p):
+                    depth = os.path.relpath(cur, extract_dir).count(os.sep) + 1
+                    candidates.append((depth, p))
+    except OSError as e:
+        logging.warning("[下载] 扫描 app.yaml 失败: %s", e)
+
+    if not candidates:
+        logging.warning("[下载] 未找到应用包元信息文件 %s/%s，将沿用任务参数中的名称与版本",
+                        _META_DIR, _META_FILE)
+        return {}
+
+    candidates.sort(key=lambda x: x[0])
+    meta_path = candidates[0][1]
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = yaml.safe_load(f) or {}
+    except Exception as e:
+        logging.error("[下载] 解析 app.yaml 失败: %s -> %s", meta_path, e)
+        return {}
+
+    if not isinstance(meta, dict):
+        logging.error("[下载] app.yaml 不是键值对结构: %s", meta_path)
+        return {}
+
+    name = str(meta.get("name", "") or "").strip()
+    version = str(meta.get("version", "") or "").strip()
+    logging.info("[下载] 读取应用包元信息: %s -> name=%s version=%s", meta_path, name, version)
+
+    result = {}
+    if name:
+        result["name"] = name
+    if version:
+        result["version"] = version
+    return result
+
+
+def write_app_id(version_dir: str, app_id) -> bool:
+    """
+    下载成功后，把平台的应用记录 ID 写进包内 config/app.yaml（键名 appId）。
+
+    用途：让节点本地每个「版本目录」都能对应回平台的应用记录
+    （平台侧任务参数由 applicationId 而来），便于回滚/版本列表等场景
+    直接从节点侧拿到应用 ID，而不必依赖实例当时绑定的版本。
+
+    参数:
+        version_dir: 归位后的版本目录 {download}[/sub_dir]/{name}/{version}
+        app_id:      平台应用记录 ID（可为 str/int，空值则跳过）
+
+    返回:
+        bool: 写入成功 True；无 app_id 或写失败 False（失败只告警，不影响下载结果）
+    """
+    if not version_dir:
+        return False
+    app_id = str(app_id or "").strip()
+    if not app_id:
+        logging.info("[下载] 未下发 app_id，跳过写入 app.yaml")
+        return False
+
+    meta_path = os.path.join(version_dir, _META_DIR, _META_FILE)
+    try:
+        meta = {}
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = yaml.safe_load(f) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+        meta["appId"] = app_id
+        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(meta, f, allow_unicode=True, sort_keys=False,
+                           default_flow_style=False)
+        logging.info("[下载] 已写入应用ID到 app.yaml: %s -> appId=%s", meta_path, app_id)
+        return True
+    except Exception as e:
+        logging.warning("[下载] 写入应用ID到 app.yaml 失败: %s -> %s", meta_path, e)
+        return False
+
+
+def _normalize_extracted_dir(extract_dir: str) -> Optional[str]:
+    """
+    把解压内容归位到标准结构所在的目录，返回该目录路径。
+
+    「确定结构」指业务目录直接位于某一层之下，如：
+        {X}/bin/  {X}/config/  {X}/app/
+    本函数自顶向下（广度优先）寻找第一个含有这三个目录之一的层级，把它作为标准根。
+
+    处理场景：
+      - ruoyi/{bin,config,app}        -> 返回 {extract}/ruoyi
+      - ruoyi/3.9.2/{bin,config,app}  -> 返回 {extract}/ruoyi/3.9.2
+      - {bin,config,app} 在解压根     -> 返回 {extract}
+      - a/ruoyi/{bin,config,app}      -> 返回 {extract}/a/ruoyi
+
+    参数:
+        extract_dir: 解压目标目录
+
+    返回:
+        标准根目录路径；找不到任何业务目录时返回 None
+    """
+    if not os.path.isdir(extract_dir):
+        return None
+
+    # 广度优先：优先命中最浅的层级
+    queue = [extract_dir]
+    while queue:
+        cur = queue.pop(0)
+        try:
+            names = set(os.listdir(cur))
+        except OSError:
+            continue
+        hit = [d for d in _STD_DIRS if d in names and os.path.isdir(os.path.join(cur, d))]
+        if hit:
+            logging.info("[下载] 识别到标准目录结构 %s，标准根目录: %s", hit, cur)
+            return cur
+        for d in sorted(names):
+            p = os.path.join(cur, d)
+            if os.path.isdir(p) and not os.path.islink(p):
+                queue.append(p)
+
+    logging.warning("[下载] 未在解压内容中识别到 %s 任一目录，无法归位", list(_STD_DIRS))
+    return None
+
+
 def check_md5(file_path: str, expected_md5: str) -> bool:
     """
     检查文件的MD5值
@@ -192,33 +364,11 @@ def _build_download_result(
     return payload
 
 
-# =============================================================================
-# 读取 runtime/config.yaml
-# =============================================================================
-
-def _read_runtime_config(save_path: str, file_name: str) -> Dict[str, Any]:
-    """
-    从 {save_path}/{file_name}/runtime/config.yaml 读取服务版本和 Nacos 配置。
-
-    注意: download.py 不再调用此函数（下载前该文件尚不存在）。
-    保留该函数仅因为 upgrade.py 等其他模块仍 import 使用。
-
-    返回:
-        解析后的配置字典，文件不存在或读取失败返回空 dict
-    """
-    config_path = os.path.join(save_path, file_name, "runtime", "config.yaml")
-    if not os.path.isfile(config_path):
-        logging.warning("[下载] runtime/config.yaml 不存在: %s", config_path)
-        return {}
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        logging.info("[下载] 已从 runtime/config.yaml 读取配置: %s", config_path)
-        return config if isinstance(config, dict) else {}
-    except Exception as e:
-        logging.error("[下载] 读取 runtime/config.yaml 失败: %s -> %s", config_path, e)
-        return {}
+# 注：原 _read_runtime_config() 已删除。
+#     它从 {download}/{服务}/{版本}/runtime/config.yaml 读取 Nacos 配置，
+#     但该文件在新架构中不再存在（Nacos 配置已迁至运行区
+#     {apps}/{服务}/nacos/config.yaml，由 nacos_register 直接读取），
+#     且全项目已无任何调用方。
 
 
 # =============================================================================
@@ -286,6 +436,8 @@ def _validate_and_extract_params(parameters: Dict[str, Any]) -> tuple:
         'file_name': custom_file_name,
         'file_suffix': file_suffix,
         'version': version,
+        # 平台下发的应用记录 ID（写入包内 config/app.yaml，键名 appId）
+        'app_id': str(parameters.get('app_id', '') or '').strip(),
     }
 
     return None, params
@@ -313,7 +465,7 @@ def _build_service_data(file_name: str, version: str = "") -> Dict[str, Any]:
 
 
 # =============================================================================
-# 下载环境准备（目录、版本检查、application.yml）
+# 下载环境准备（目录、版本检查）
 # =============================================================================
 
 def _prepare_download_environment(
@@ -326,6 +478,9 @@ def _prepare_download_environment(
     准备下载目录结构：找 file_name 目录（不存在则创建）、找版本号目录（不存在则创建）。
     若版本号目录下已有文件，则视为已下载，返回失败。
     版本号仅从参数传入（下载前 {file_name}/runtime/config.yaml 尚不存在，无法读取）。
+
+    说明：本函数只负责建立「下载缓存」目录骨架，不生成 version 文件与
+    application.yml —— 这两者属运行区内容，由 install 阶段处理。
 
     参数:
         task_id:        任务ID
@@ -370,63 +525,12 @@ def _prepare_download_environment(
     if os.listdir(version_dir):
         logging.info(f"[任务管理] 版本目录下已有文件，将直接覆盖重新下载: {version_dir}")
 
-    # 写入版本文件
-    version_file = os.path.join(save_dir, "version")
-    try:
-        with open(version_file, "w", encoding="utf-8") as vf:
-            vf.write(version)
-    except Exception as e:
-        logging.error(f"[任务管理] 写入版本文件失败: {e}")
-        return (
-            _build_download_result(task_id, False, f"写入版本文件失败: {e}",
-                                   error_type="VersionFileWriteError", error_message=str(e)),
-            "", ""
-        )
-
     logging.info(f"[任务管理] 创建版本目录: {version_dir}")
 
-    # ── 构建 platform 节点（来源为全局 config.yaml，与组件无关）──
-    platform_cfg = {}
-    if _SERVER_IP:
-        platform_cfg["host"] = _SERVER_IP
-    if _SERVER_PORT:
-        try:
-            platform_cfg["port"] = int(_SERVER_PORT)
-        except (ValueError, TypeError):
-            logging.warning(f"[任务管理] server.port 不是有效整数: {_SERVER_PORT}，已忽略")
-    if _INTERFACE_REGISTER_URL:
-        platform_cfg["registerUrl"] = _INTERFACE_REGISTER_URL
-    if _INTERFACE_DEREGISTER_URL:
-        platform_cfg["deregisterUrl"] = _INTERFACE_DEREGISTER_URL
-    if not platform_cfg:
-        logging.warning("[任务管理] platform 配置缺失，application.yml 将不包含 platform 节点")
-    if not _SERVER_IP:
-        logging.warning("[任务管理] server.ip 未配置，platform.host 将缺失")
-
-    # ── 拼装 application.yml 内容（不读 runtime/config.yaml，nacos 节点由后续注册流程补充）──
-    app_yml_content = {
-        "component": {
-            "name": file_name,
-            "displayName": file_name,
-            "version": version,
-            "type": "MASTER",
-            "description": "",
-        },
-    }
-    if platform_cfg:
-        app_yml_content["platform"] = platform_cfg
-    app_yml_path = os.path.join(version_dir, "application.yml")
-    try:
-        with open(app_yml_path, "w", encoding="utf-8") as yf:
-            yaml.dump(app_yml_content, yf, allow_unicode=True, default_flow_style=False, sort_keys=False)
-        logging.info(f"[任务管理] 生成组件描述文件: {app_yml_path}")
-    except Exception as e:
-        logging.error(f"[任务管理] 生成 application.yml 失败: {e}")
-        return (
-            _build_download_result(task_id, False, f"生成 application.yml 失败: {e}",
-                                   error_type="AppYmlWriteError", error_message=str(e)),
-            "", ""
-        )
+    # ── 不再生成 version 文件与 application.yml ──
+    # 下载区仅作为「缓存」：只落应用包解压后的原始内容（app/ bin/ config/）。
+    # 版本信息由 {save_dir}/{version}/ 目录名体现；
+    # 组件描述 application.yml 与版本指向文件改由 install 阶段在「运行区」生成。
 
     return None, save_dir, version_dir
 
@@ -550,6 +654,39 @@ def _download_file(
 # 压缩包解压
 # =============================================================================
 
+def _restore_zip_permissions(zf: Any, dest_dir: str) -> None:
+    """
+    恢复 zip 内文件的 Unix 权限位。
+
+    Python zipfile.extractall 不会恢复 external_attr 中的权限位（尤其是
+    Windows 上打出的 zip），导致解压后的脚本/二进制失去执行权限，后续
+    start/stop 脚本直接执行二进制时会报 Permission denied。这里按 zip
+    内记录的 Unix 模式位重新 chmod。
+
+    （与 xkt_download.py / plugin_download.py 的实现保持一致，三族下载行为统一。）
+
+    参数:
+        zf:       已打开的 zipfile.ZipFile 对象
+        dest_dir: 解压目标目录
+    """
+    try:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            # external_attr 高 16 位为 Unix 权限位（与 unzip 命令行为一致）
+            mode = (info.external_attr >> 16) & 0o7777
+            if not mode:
+                continue
+            target = os.path.join(dest_dir, info.filename)
+            if os.path.exists(target):
+                try:
+                    os.chmod(target, mode)
+                except OSError as e:
+                    logging.warning("[任务管理] 恢复文件权限失败 %s: %s", target, e)
+    except Exception as e:
+        logging.warning("[任务管理] 恢复 zip 文件权限异常: %s", e)
+
+
 def _extract_archive(archive_path: str, dest_dir: str) -> bool:
     """
     解压压缩包到目标目录。
@@ -568,6 +705,8 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
             import zipfile
             with zipfile.ZipFile(archive_path, "r") as zf:
                 zf.extractall(dest_dir)
+                # Python zipfile 不恢复 Unix 权限位，需手动恢复
+                _restore_zip_permissions(zf, dest_dir)
         elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
             import tarfile
             with tarfile.open(archive_path, "r:gz") as tf:
@@ -590,55 +729,149 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
         return False
 
 
-def _strip_single_top_dir(dest_dir: str) -> None:
-    """
-    剥离解压目录中多余的单一顶层目录。
+# 注：原 _strip_single_top_dir() 已删除。
+#     它是「剥离单一顶层目录」的旧归位实现，已被 reorganize_to_standard_layout()
+#     完全取代（后者能处理多层嵌套/多顶层目录/源码风格包，能力更强），
+#     且全项目已无任何调用方。
 
-    组件压缩包常见结构为顶层带一个与组件同名的目录（如 ruoyi/），
-    解压后为 dest_dir/ruoyi/{bin,app,config,...}。而 install/start/stop/
-    uninstall 等任务统一按 {component_dir}/{version}/bin/ 定位脚本，
-    因此需将顶层目录内容提升到 dest_dir 根。
 
-    仅当 dest_dir 下「恰好只有一个子目录、无其他顶层文件」时才剥离，避免误伤
-    本来就是扁平结构的压缩包。下载流程会预先在 dest_dir 根生成 application.yml
-    （组件描述文件），剥离时需将其排除，且不覆盖已存在的同名文件。
+# =============================================================================
+# 归位到标准结构 {download}/{name}/{version}/{bin,app,config}
+# =============================================================================
 
-    若唯一顶层目录名本身就是 bin（压缩包扁平结构，bin 已在最外层），则跳过剥离，
-    否则 bin 被提升掉后，install/start/stop 按 {version}/bin/ 定位脚本将失败。
-    """
-    try:
-        entries = os.listdir(dest_dir)
-    except OSError as e:
-        logging.warning("[任务管理] 检查顶层目录失败: %s: %s", dest_dir, e)
+def cleanup_dir(path: str) -> None:
+    """递归删除目录，失败只记日志不抛异常。"""
+    if not path or not os.path.exists(path):
         return
-    subdirs = [e for e in entries if os.path.isdir(os.path.join(dest_dir, e))]
-    # application.yml 为下载流程预生成的组件描述文件，不属于压缩包内容，排除
-    files = [
-        e for e in entries
-        if os.path.isfile(os.path.join(dest_dir, e)) and e != "application.yml"
-    ]
-    if len(subdirs) == 1 and not files:
-        top_dir = subdirs[0]
-        if top_dir.strip().lower() == "bin":
-            logging.info("[任务管理] 顶层目录为 bin，属扁平结构，跳过剥离: %s", dest_dir)
-            return
-        top_path = os.path.join(dest_dir, top_dir)
-        logging.info("[任务管理] 检测到压缩包单一顶层目录: %s, 剥离并提升内容到: %s",
-                     top_dir, dest_dir)
-        for name in os.listdir(top_path):
-            src = os.path.join(top_path, name)
-            dst = os.path.join(dest_dir, name)
-            if os.path.exists(dst):
-                logging.warning("[任务管理] 提升时跳过已存在的同名路径: %s", dst)
+    try:
+        import shutil
+        shutil.rmtree(path)
+        logging.info("[任务管理] 已清理临时目录: %s", path)
+    except Exception as e:
+        logging.warning("[任务管理] 清理临时目录失败: %s -> %s", path, e)
+
+
+def reorganize_to_standard_layout(extract_dir: str, save_path: str,
+                                  app_name: str, version: str,
+                                  sub_dir: str = "") -> str:
+    """
+    把解压出来的内容归位到 {save_path}/{sub_dir}/{app_name}/{version}/ 标准结构。
+
+    sub_dir 用于区分应用类别（虚拟机应用无该层、插件应用为 plugin/、显控台为 xkt/），
+    与 install/start/stop 等任务定位脚本时使用的层级保持一致。
+
+    后置条件（缓存区的形状）：
+        {save_path}/{sub}/{app_name}/{version}/bin/             ← 脚本定位目录
+        {save_path}/{sub}/{app_name}/{version}/app/
+        {save_path}/{sub}/{app_name}/{version}/config/          含 app.yaml
+
+    注：不再生成 version 标记文件与 application.yml —— 下载区只作缓存，
+        版本信息由版本号目录名体现，运行态元数据由 install 阶段在运行区处理。
+
+    归位规则：
+      1. 找到标准根目录（含 bin/config/app 任一的最浅层级）
+      2. 把标准根下的 bin/app/config 三个目录搬到版本目录
+      3. 标准根下的其余条目（jar、lib、其他文件）一并搬到版本目录根，
+         保证原包内容不丢
+      4. 若包内本来就没有 bin/ 等目录（如源码风格包），则把标准根下所有
+         内容整体搬到版本目录，至少保证文件不丢、结构可预期
+
+    参数:
+        extract_dir: 解压目录
+        save_path:   下载根目录（config.yaml 的 server.download）
+        app_name:    应用名（来自 app.yaml，缺失时用任务参数兜底）
+        version:     版本号（来自 app.yaml，缺失时用任务参数兜底）
+        sub_dir:     类别子目录（"" / "plugin" / "xkt"）
+
+    返回:
+        版本目录的绝对路径
+    """
+    component_dir = os.path.join(save_path, sub_dir, app_name) if sub_dir \
+        else os.path.join(save_path, app_name)
+    version_dir = os.path.join(component_dir, version)
+    os.makedirs(version_dir, exist_ok=True)
+
+    # 版本号目录下已有内容 → 覆盖式重下：先清空，避免新旧文件混杂
+    try:
+        old = os.listdir(version_dir)
+        if old:
+            logging.info("[任务管理] 版本目录下已有内容，清空后重新归位: %s", version_dir)
+            for name in old:
+                p = os.path.join(version_dir, name)
+                if os.path.isdir(p) and not os.path.islink(p):
+                    import shutil
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+    except Exception as e:
+        logging.warning("[任务管理] 清空版本目录失败（继续归位）: %s", e)
+
+    # ── 定位标准根 ──
+    std_root = _normalize_extracted_dir(extract_dir)
+
+    if std_root is None:
+        # 没有识别到任何标准目录：把解压内容整体搬过去，至少不丢文件
+        logging.warning("[任务管理] 未识别到标准目录，整体搬运解压内容到: %s", version_dir)
+        _move_children(extract_dir, version_dir)
+    elif os.path.abspath(std_root) == os.path.abspath(extract_dir):
+        # 标准根就是解压根：直接搬
+        _move_children(std_root, version_dir)
+    else:
+        # 标准根是子目录：先把 bin/app/config 三个目录搬过去（保证脚本就位），
+        # 再把标准根下的其余内容一并搬过去（不丢文件）
+        moved = []
+        for d in _STD_DIRS:
+            src = os.path.join(std_root, d)
+            if os.path.isdir(src):
+                dst = os.path.join(version_dir, d)
+                _move_path(src, dst)
+                moved.append(d)
+        for name in sorted(os.listdir(std_root)):
+            if name in moved:
                 continue
-            try:
+            _move_path(os.path.join(std_root, name), os.path.join(version_dir, name))
+        logging.info("[任务管理] 已从标准根 %s 归位目录: %s", std_root, moved)
+
+    # ── 不再生成 version 文件与 application.yml ──
+    # 下载区仅作为「缓存」，只承载应用包解压后的原始内容。
+    # 版本定位改由 {component_dir}/{version}/ 这一层目录名体现；
+    # 组件描述 application.yml 改由 install 阶段在「运行区」生成。
+    logging.info("[任务管理] 归位完成: %s", version_dir)
+    return version_dir
+
+
+def _move_path(src: str, dst: str) -> None:
+    """把 src 搬到 dst。dst 已存在时：目录则合并内容，文件则覆盖。"""
+    if not os.path.exists(src):
+        return
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src) and not os.path.islink(src):
+            if os.path.isdir(dst):
+                # 目标目录已存在：递归合并，不整体覆盖
+                _move_children(src, dst)
+                try:
+                    os.rmdir(src)
+                except OSError:
+                    pass
+            else:
+                if os.path.exists(dst):
+                    os.remove(dst)
                 os.replace(src, dst)
-            except Exception as e:
-                logging.error("[任务管理] 提升文件失败 %s -> %s: %s", src, dst, e)
-        try:
-            os.rmdir(top_path)
-        except OSError:
-            pass
+        else:
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.replace(src, dst)
+    except Exception as e:
+        logging.error("[任务管理] 搬运失败 %s -> %s: %s", src, dst, e)
+
+
+def _move_children(src_dir: str, dst_dir: str) -> None:
+    """把 src_dir 下的所有条目搬到 dst_dir（逐个处理，支持目录合并）。"""
+    if not os.path.isdir(src_dir):
+        return
+    for name in sorted(os.listdir(src_dir)):
+        _move_path(os.path.join(src_dir, name), os.path.join(dst_dir, name))
 
 
 # =============================================================================
@@ -676,7 +909,7 @@ def download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300
                                       error_type="VersionMissing",
                                       error_message="下载前无法读取 runtime/config.yaml，version 必须由参数显式传入")
 
-    # ── 3. 准备下载环境（目录、版本检查、application.yml）──
+    # ── 3. 准备下载环境（目录、版本检查）──
     error, save_dir, version_dir = _prepare_download_environment(
         task_id, save_path, file_name, version
     )
@@ -709,54 +942,116 @@ def download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300
     else:
         logging.info("[任务管理] Windows系统，跳过token认证")
 
-    # ── 5. 拼接文件名并下载到版本目录 ──
+    # ── 5. 拼接文件名并下载到临时位置 ──
+    # 先下到临时目录，解压读出 app.yaml 的 name/version 后再归位到正式目录，
+    # 因为「目标目录名」只有在解开包、读到元信息之后才能确定。
     if not file_suffix.startswith('.'):
         file_suffix = '.' + file_suffix
     file_name_with_suffix = file_name + file_suffix
-    target_file_path = os.path.join(version_dir, file_name_with_suffix)
+
+    staging_dir = os.path.join(save_path, ".staging", f"{file_name}-{int(time.time())}")
+    try:
+        os.makedirs(staging_dir, exist_ok=True)
+    except Exception as e:
+        return _build_download_result(task_id, False,
+                                      f"创建临时目录失败: {e}",
+                                      data={"staging_dir": staging_dir},
+                                      error_type="StagingDirError", error_message=str(e))
+    target_file_path = os.path.join(staging_dir, file_name_with_suffix)
 
     logging.info(f"[任务管理] 下载文件: {params['download_url']} -> {target_file_path}"
                  f", 重试: {retry}, 超时: {timeout}s")
 
     result = _download_file(task_id, params['download_url'], target_file_path, retry, timeout, token)
+    if not result.get("result"):
+        # 下载失败：清理临时目录
+        cleanup_dir(staging_dir)
+        result['data'] = {
+            "download_url": params['download_url'],
+            "save_path": save_path,
+            "file_name": file_name_with_suffix,
+            **result.get('data', {}),
+            **_build_service_data(file_name, version)
+        }
+        return result
 
-    # ── 6. 下载成功后解压到版本目录 ──
-    if result.get("result"):
-        extract_ok = _extract_archive(target_file_path, version_dir)
-        if extract_ok:
-            # 解压成功后删除压缩包
-            try:
-                os.remove(target_file_path)
-                logging.info("[任务管理] 已删除压缩包: %s", target_file_path)
-            except Exception as rm_err:
-                logging.warning("[任务管理] 删除压缩包失败: %s", rm_err)
-            # 剥离压缩包单一顶层目录（如 ruoyi/），使 install/start/stop 等按
-            # {component_dir}/{version}/bin/ 定位生效
-            _strip_single_top_dir(version_dir)
-            result['data']["status"] = "downloaded_and_extracted"
-            result['data']["extracted_dir"] = version_dir
-        else:
-            result = _build_download_result(task_id, False,
-                                            f"解压失败: {target_file_path}",
-                                            data={
-                                                "download_url": params['download_url'],
-                                                "save_path": save_path,
-                                                "file_name": file_name_with_suffix,
-                                                "file_path": target_file_path,
-                                                "version_dir": version_dir,
-                                                **_build_service_data(file_name, version)
-                                            },
-                                            error_type="ExtractError",
-                                            error_message="下载成功但解压失败，请检查压缩包格式")
-            return result
+    # ── 6. 解压到临时目录 ──
+    extract_dir = os.path.join(staging_dir, "extract")
+    if not _extract_archive(target_file_path, extract_dir):
+        cleanup_dir(staging_dir)
+        return _build_download_result(task_id, False,
+                                      f"解压失败: {target_file_path}",
+                                      data={
+                                          "download_url": params['download_url'],
+                                          "save_path": save_path,
+                                          "file_name": file_name_with_suffix,
+                                          "file_path": target_file_path,
+                                          **_build_service_data(file_name, version)
+                                      },
+                                      error_type="ExtractError",
+                                      error_message="下载成功但解压失败，请检查压缩包格式")
 
-    # 合并通用数据和服务数据到返回结果
+    # 解压成功即可删除压缩包，后续只用解压内容
+    try:
+        os.remove(target_file_path)
+        logging.info("[任务管理] 已删除压缩包: %s", target_file_path)
+    except Exception as rm_err:
+        logging.warning("[任务管理] 删除压缩包失败: %s", rm_err)
+
+    # ── 7. 从 app.yaml 读取权威的应用名与版本号 ──
+    meta = read_app_meta(extract_dir)
+    meta_name = meta.get("name", "")
+    meta_version = meta.get("version", "")
+    # 应用名与版本号一律以「平台下发参数」为准，不用 app.yaml 覆盖。
+    # 原因：下载只是缓存区落地，后续 install/start/stop/upgrade/uninstall
+    #       全部用平台的应用名与版本号定位目录（见 InstanceServiceImpl 里
+    #       各任务均取 app.getAppName() / app.getVersion()）。
+    #       若此处按 app.yaml 改名，会导致「下载落地 nacos/，
+    #       安装却找 nacos-xkt/」这类定位失败。
+    # app.yaml 与参数不一致时仅告警，便于发现上传时的录入错误。
+    if meta_name and meta_name != file_name:
+        logging.warning("[任务管理] app.yaml 应用名(%s) 与平台应用名(%s) 不一致，"
+                        "以平台为准归位", meta_name, file_name)
+    if meta_version and meta_version != version:
+        logging.warning("[任务管理] app.yaml 版本号(%s) 与平台版本号(%s) 不一致，"
+                        "以平台为准归位", meta_version, version)
+    final_name = file_name
+    final_version = version
+
+    # ── 8. 归位到 {download}/{name}/{version}/ ──
+    try:
+        final_version_dir = reorganize_to_standard_layout(
+            extract_dir, save_path, final_name, final_version
+        )
+    except Exception as e:
+        logging.error("[任务管理] 归位失败: %s", e, exc_info=True)
+        cleanup_dir(staging_dir)
+        return _build_download_result(task_id, False,
+                                      f"整理目录结构失败: {e}",
+                                      data={
+                                          "download_url": params['download_url'],
+                                          "save_path": save_path,
+                                          "extract_dir": extract_dir,
+                                          **_build_service_data(file_name, version)
+                                      },
+                                      error_type="ReorganizeError", error_message=str(e),
+                                      tb=traceback.format_exc())
+
+    # 清理临时目录
+    cleanup_dir(staging_dir)
+
+    # ── 9. 下载成功：把平台下发的应用记录 ID 写入包内 config/app.yaml（键名 appId）──
+    write_app_id(final_version_dir, params.get("app_id"))
+
+    result['data']["status"] = "downloaded_and_extracted"
+    result['data']["extracted_dir"] = final_version_dir
+    # 合并通用数据和服务数据到返回结果（服务信息以 app.yaml 解析结果为准）
     result['data'] = {
         "download_url": params['download_url'],
         "save_path": save_path,
         "file_name": file_name_with_suffix,
         **result.get('data', {}),
-        **_build_service_data(file_name, version)
+        **_build_service_data(final_name, final_version)
     }
     return result
 

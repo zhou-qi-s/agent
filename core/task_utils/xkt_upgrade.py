@@ -1,294 +1,693 @@
 """
-core/task_utils/xkt_upgrade.py - 显控升级模块
+升级服务任务模块
 
-模型 A（与 xkt_download / xkt_stop / xkt_start / xkt_Install / xkt_uninstall 一致）：
-    {download}/displayConsole/{service_name}/
-    ├── version                     # 当前版本号文件
-    └── {version}/
-        ├── bin/{start,stop,install,uninstall}.sh
-        └── runtime/pid
+与 upgrade.py 结构完全对齐，唯一区别：路径多一层 displayConsole/（由 _SUB_DIR 承载）。
 
-升级流程 = 停止旧版本 + 下载新版本 + 启动新版本：
-    1. 读 version 文件获取当前版本
-    2. 调用 xkt_stop_task 停止当前版本（读 version 文件定位 bin/stop.sh）
-    3. 调用 xkt_download_task 下载并部署新版本（创建 {service_dir}/{version}/，写 version 文件）
-    4. 调用 xkt_start_task 启动新版本（读 version 文件定位新版本 bin/start.sh）
-    任一步失败 → 回滚：删除新版本目录、恢复 version 文件、重启旧版本。
+完整流程：版本比对 → 校验缓存区已下载版本 → 停止旧版本 → 安装 → 启动（**不再下载**）
+
+缓存区/运行区分离后：
+    · 版本来源   → state/config.yaml 的 version 字段（原为 {component}/version 文件）
+    · 组件定位   → 运行区 {server.apps}/{service_name}/
+    · 升级动作   → **不再下载**：升级入口（平台侧）只允许选缓存区里已下载的版本，
+                   这里校验 {download}/displayConsole/{service_name}/{版本}/ 存在后，
+                   由 install 阶段重建 current 软链接指向该版本（包已在节点上）
+    · 回滚动作   → **仅把 current 软链接指回旧版本**，其余文件共用无需动
+                   （新版本内容保留在缓存区，可再次升级时复用）
+
+说明：app/bin/config 三个软链接指向 `current/xxx`，因此改 current 的指向
+即可整体切换版本；子任务（download/install/start）均已完成运行区适配。
 """
 
 import logging
 import os
 import shutil
+import subprocess
 import traceback
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from core.xkt.process_check import collect_service_pids
-from utils import util
+from utils.app_path import (
+    SUB_DIR_XKT,
+    find_apps_component_dir,
+    find_cache_version_dir,
+    list_cache_versions,
+    read_state,
+    write_state,
+    read_state_pids,
+    filter_alive_pids,
+    refresh_state_pids,
+    link_to_current,
+)
 from utils.config_loader import load_config
-from core.task_utils.xkt_download import xkt_download_task
-from core.task_utils.xkt_stop import xkt_stop_task
+# 注意：显控台升级必须使用「显控台版」的下载/安装/启动任务。
+# 虚拟机版（download/install/start）的路径不含子目录层
+# （{download}/{name}/{version}），会把新版下到 displayConsole/ 之外，
+# 导致后续安装定位不到版本目录。显控台版路径为
+# {download}/{sub_dir}/{name}/{version}，与运行区结构一致。
+from core.task_utils.xkt_Install import xkt_install_task
 from core.task_utils.xkt_start import xkt_start_task
 
+# ── 全局配置 ──
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 本模块处理的应用类别（决定路径中的分层目录）
+_SUB_DIR = SUB_DIR_XKT
 
 
 # =============================================================================
-# 工具函数
+# 结果构建
 # =============================================================================
 
-def _read_runtime_pids(version_dir: str) -> List[int]:
-    """读取 {version_dir}/runtime/pid 中的 PID 列表（用于升级前后对比）"""
-    pid_file = os.path.join(version_dir, "runtime", "pid")
-    pids: List[int] = []
-
-    if not os.path.isfile(pid_file):
-        return pids
-
-    try:
-        with open(pid_file, "r", encoding="utf-8") as f:
-            for line in f.read().splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    pids.append(int(line))
-    except Exception as e:
-        logging.warning("[显控升级] 读取 runtime/pid 失败: %s -> %s", pid_file, e)
-
-    return pids
-
-
-def _build_result(success: bool, message: str, data: Optional[Dict[str, Any]] = None,
-                  error_type: str = "", error_message: str = "", tb: str = "") -> Dict[str, Any]:
-    """构建任务结果"""
+def _build_result(
+    task_id: str,
+    success: bool,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+    error_type: str = "",
+    error_message: str = "",
+    tb: str = "",
+) -> Dict[str, Any]:
     return {
-        "ip": util.get_ip() or "unknown",
-        "task_id": "",
-        "result": success,
-        # 3=已启动 / 7=升级失败（原为 13，而 13 在平台枚举里是“回滚失败”，
-        # 会让“升级失败”在页面上显示成“回滚失败”）
+        "success": success,
+        # 顶层状态码（平台约定）: 3=已启动 / 7=升级失败
         "status": 3 if success else 7,
+        "task_id": task_id,
         "task_type": "xkt_upgrade",
         "message": message,
-        "data": {
-            **(data or {}),
-            "error_type": error_type,
-            "error_message": error_message,
-            "traceback": tb,
-        },
+        "data": data or {},
+        "error": (
+            {}
+            if success
+            else {
+                "error_type": error_type or "UpgradeTaskError",
+                "error_message": error_message or message,
+                "traceback": tb,
+            }
+        ),
     }
 
 
-def _task_ok(result: Dict[str, Any]) -> bool:
-    """兼容子任务 success / result 两种返回格式"""
-    return bool(result.get("success") or result.get("result"))
+def _task_success(result: Dict[str, Any]) -> bool:
+    """兼容两种任务返回格式（download 用 result，install/start 用 success）"""
+    if "success" in result:
+        return bool(result["success"])
+    if "result" in result:
+        return bool(result["result"])
+    return False
 
 
-def _read_current_version(component_dir: str) -> str:
-    """读取组件目录下的 version 文件"""
-    version_file = os.path.join(component_dir, "version")
-    if not os.path.isfile(version_file):
-        return ""
-    try:
-        with open(version_file, "r", encoding="utf-8") as vf:
-            return vf.read().strip()
-    except Exception:
-        return ""
-
-
-def _service_running(component_dir: str, version: str) -> bool:
-    """通过 runtime/pid 文件判断服务是否在运行"""
-    pid_file = os.path.join(component_dir, version, "runtime", "pid")
-    if not os.path.isfile(pid_file):
-        return False
-    try:
-        with open(pid_file, "r", encoding="utf-8") as pf:
-            return bool(pf.read().strip())
-    except Exception:
-        return False
-
-
-def _rollback(component_dir: str, old_version: str, new_version: str,
-              task_id: str, service_name: str, sub_dir: str, was_running: bool) -> None:
-    """升级失败回滚：删除新版本目录 → 恢复 version 文件 → 旧版本原来在运行则重启"""
-    try:
-        target_dir = os.path.join(component_dir, new_version)
-        if os.path.isdir(target_dir):
-            shutil.rmtree(target_dir, ignore_errors=True)
-            logging.info("[xkt_upgrade] 已删除新版本目录: %s", target_dir)
-        version_file = os.path.join(component_dir, "version")
-        with open(version_file, "w", encoding="utf-8") as vf:
-            vf.write(old_version)
-        logging.info("[xkt_upgrade] 已恢复 version 文件: %s", old_version)
-        if was_running:
-            xkt_start_task({"task_id": task_id, "service_name": service_name, "sub_dir": sub_dir})
-            logging.info("[xkt_upgrade] 已尝试重启旧版本 %s", old_version)
-    except Exception as e:
-        logging.warning("[xkt_upgrade] 回滚过程出错: %s", e)
+def _task_message(result: Dict[str, Any]) -> str:
+    return str(result.get("message", "") or "")
 
 
 # =============================================================================
-# 主方法
+# 进程检测工具
 # =============================================================================
 
-def xkt_upgrade_task(parameters: Dict[str, Any], retry: int = 2, timeout: int = 300) -> Dict[str, Any]:
+def _get_process_start_ticks(pid: int) -> Optional[int]:
+    """读取 /proc/{pid}/stat 的 starttime，用于 PID 复用检测。
+
+    kill -9 后 PID 可能被内核回收并被新进程复用，仅靠 PID 存在性判断会误判。
+    返回 None 表示读取失败（进程已不存在或平台不支持）。
     """
-    显控台升级任务（模型 A）
+    if os.name == "nt":
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read().strip()
+        # 格式: "pid (comm) state ... starttime ..."，starttime 是 ')' 后第 21 个字段
+        parts = stat.rsplit(")", 1)
+        if len(parts) != 2:
+            return None
+        fields = parts[1].split()
+        if len(fields) < 20:
+            return None
+        return int(fields[19])  # starttime, 单位为时钟滴答(通常 100Hz)
+    except (OSError, FileNotFoundError, ValueError):
+        return None
 
-    流程: 解析参数 → 校验(5个必填) → 组件目录存在性 → 读 version → 版本比对
-    → 停止当前版本(xkt_stop) → 下载新版本(xkt_download) → 启动新版本(xkt_start)
-    → 任一步失败则回滚（删新版本目录 + 恢复 version + 重启旧版本）
+
+def _is_zombie_or_dead(pid: int) -> bool:
+    """检查进程是否为僵尸态(Z)或已死亡(X)。
+
+    kill -9 后进程会短暂进入僵尸态，/proc/{pid} 仍存在、os.kill(pid,0) 仍成功，
+    但进程实际已终止。此时必须检查 /proc/{pid}/stat 的 state 字段才能识别。
+    """
+    if os.name == "nt":
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read().strip()
+        parts = stat.rsplit(")", 1)
+        if len(parts) != 2:
+            return False
+        fields = parts[1].split()
+        if len(fields) == 0:
+            return False
+        return fields[0] in ("Z", "z", "X", "x")
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> bool:
+    """检查进程是否真的存活（跨平台）。
+
+    多重校验防止误判：
+    1. os.kill(pid, 0) 检查信号发送
+    2. /proc/{pid}/stat 状态为 Z(僵尸)/X(死亡) → 视为已停止
+    3. 若提供了停止前的 starttime，对比发现 PID 已被复用 → 视为已停止
+    """
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True,
+            )
+            return str(pid) in proc.stdout
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            # ── 检查1: 僵尸/已死亡进程视为已停止 ──
+            if _is_zombie_or_dead(pid):
+                logging.info("[xkt_upgrade_task] PID %d 处于僵尸/死亡态，判定为已停止", pid)
+                return False
+            # ── 检查2: starttime 比对 ──
+            # 读不到 starttime 说明 /proc/{pid}/stat 已不可读（进程正在消失），
+            # 同样判定为已停止；读到但值不同说明 PID 被复用。
+            if expected_start_ticks is not None:
+                current_start = _get_process_start_ticks(pid)
+                if current_start is None:
+                    logging.info("[xkt_upgrade_task] PID %d 的 starttime 已不可读（进程正在退出），判定为已停止", pid)
+                    return False
+                if current_start != expected_start_ticks:
+                    logging.warning(
+                        "[xkt_upgrade_task] PID %d 启动时间已变化，该 PID 已被复用，原进程已停止",
+                        pid,
+                    )
+                    return False
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, Any]:
+    """执行脚本，返回 {success, exit_code, stdout, stderr}"""
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(
+                [script_path],
+                cwd=bin_dir,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+        else:
+            proc = subprocess.run(
+                ["bash", script_path],
+                cwd=bin_dir,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "exit_code": -1, "stdout": "", "stderr": f"脚本执行超时 ({timeout}s)"}
+    except Exception as e:
+        return {"success": False, "exit_code": -1, "stdout": "", "stderr": f"脚本执行异常: {e}"}
+
+
+# =============================================================================
+# 回滚
+# =============================================================================
+
+def _rollback(
+    service_name: str,
+    current_version: str,
+    new_version: str,
+    was_running: bool,
+    timeout: int,
+) -> List[str]:
+    """
+    回滚升级操作。
+
+    缓存区/运行区分离后，回滚极其轻量：
+        ① 把运行区 current 软链接**指回旧版本**（核心动作，其余文件共用无需动）
+        ② 恢复 state/config.yaml 的 version 字段
+        ③ 若旧进程升级前在运行，则重新启动
+
+    **不再删除新版本目录** —— 新版本内容与旧版本平级共存在缓存区，
+    以后想再升级可直接复用，无需重新下载。
+
+    返回回滚步骤描述列表。
+    """
+    rollback_steps: List[str] = []
+
+    if not current_version:
+        rollback_steps.append("无旧版本可回滚")
+        return rollback_steps
+
+    # 1. 把 current 软链接指回旧版本（app/bin/config 无需重建，它们指向 current/xxx）
+    relink = link_to_current(service_name, current_version, sub_dir=_SUB_DIR)
+    if relink.get("ok"):
+        msg = f"current 软链接已回滚到旧版本: {current_version}"
+        logging.info("[xkt_upgrade_task][rollback] %s", msg)
+    else:
+        msg = f"回滚软链接失败: {relink.get('error')}"
+        logging.error("[xkt_upgrade_task][rollback] %s", msg)
+    rollback_steps.append(msg)
+
+    # 2. 恢复运行状态中的版本号
+    state = read_state(service_name, _SUB_DIR)
+    if state:
+        state["version"] = current_version
+        if write_state(service_name, state, _SUB_DIR):
+            msg = f"运行状态 version 已恢复为: {current_version}"
+            logging.info("[xkt_upgrade_task][rollback] %s", msg)
+        else:
+            msg = "运行状态写入失败"
+            logging.warning("[xkt_upgrade_task][rollback] %s", msg)
+        rollback_steps.append(msg)
+    else:
+        rollback_steps.append("运行状态文件不存在，跳过版本号恢复")
+
+    # 3. 如果旧进程之前是运行的，重新启动
+    if was_running:
+        start_result = xkt_start_task({
+            "task_id": "rollback-start",
+            "service_name": service_name,
+            "version": current_version,
+            "sub_dir": _SUB_DIR,
+        }, retry=0, timeout=timeout)
+        if _task_success(start_result):
+            msg = "旧版本已重新启动"
+            logging.info("[xkt_upgrade_task][rollback] %s", msg)
+        else:
+            msg = f"旧版本重启失败: {_task_message(start_result)}"
+            logging.error("[xkt_upgrade_task][rollback] %s", msg)
+        rollback_steps.append(msg)
+    else:
+        rollback_steps.append("旧版本未运行，无需重启")
+
+    return rollback_steps
+
+
+# =============================================================================
+# 主入口
+# =============================================================================
+
+def xkt_upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
+    """
+    升级服务任务（版本比对 → 校验缓存区已下载版本 → 停止旧版 → 安装 → 启动；**不再下载**）。
 
     参数:
-        - task_id:       任务ID（必填）
-        - service_name:  服务名称（必填），同时也是组件目录名
-        - download_url:  新版本下载地址（必填）
-        - file_suffix:   下载文件后缀（必填，兼容旧字段名 suffix）
-        - version:       目标版本号（必填）
-        - sub_dir:       专属子目录（可选，默认 displayConsole）
+        - task_id:      任务ID（必填）
+        - service_name: 服务名称（必填），同时也是组件目录名
+        - version:      新版本号（必填，必须已在缓存区下载过）
+        - download_url / file_suffix: 兼容保留，不再使用
+
+    流程:
+        1. 从运行区 state/config.yaml 读取当前版本
+        2. 校验参数（task_id / service_name / version 必填；download_url 已不再需要）
+        3. 若当前版本 == 新版本 → 返回 "该版本正在使用"
+        4. **先校验该版本已在缓存区**（未下载则直接报错返回，此时旧服务未被动过）
+        5. 若当前版本不同，停止旧版本:
+           a. 依 state 的存活 pids 判断是否在运行 → 执行运行区 bin/stop.sh
+           b. 校验进程已销毁 → 清空运行状态
+        6. 安装（rebuild current 软链接指向新版本）
+        7. 启动新版本
+        8. 任一步失败 → 回滚（current 切回旧版本，并尝试恢复运行）
+
+    版本切换只重建 current 软链接，app/bin/config 保持共用。
     """
-    task_id = str(parameters.get('task_id', '') or '').strip()
+    task_id = str(parameters.get("task_id", "") or "").strip()
+    service_name = str(parameters.get("service_name", "") or "").strip()
+    download_url = str(parameters.get("download_url", "") or "").strip()
+    file_suffix = str(parameters.get("file_suffix", "") or "").strip()
+    version = str(parameters.get("version", "") or "").strip()
+    # 平台应用记录 ID（下载成功后写入新版目录的 config/app.yaml）
+    app_id = str(parameters.get("app_id", "") or "").strip()
 
-    def build_result(success: bool, message: str, data: Optional[Dict[str, Any]] = None,
-                     error_type: str = "", error_message: str = "", tb: str = "") -> Dict[str, Any]:
-        result = _build_result(success, message, data, error_type, error_message, tb)
-        result['task_id'] = task_id
-        return result
-
-    # ── 1. 解析参数 ──
-    service_name = str(parameters.get('service_name', '') or '').strip()
-    download_url = str(parameters.get('download_url', '') or '').strip()
-    file_suffix = str(parameters.get('file_suffix', '') or parameters.get('suffix', '') or '').strip()
-    version = str(parameters.get('version', '') or '').strip()
-    sub_dir = str(parameters.get('sub_dir', '') or 'displayConsole').strip()
-
-    # ── 2. 参数校验（5 个必填）──
-    missing = [k for k, v in {
-        'task_id': task_id, 'service_name': service_name,
-        'download_url': download_url, 'file_suffix': file_suffix, 'version': version,
-    }.items() if not v]
+    # ── 参数校验 ──
+    # 注意：升级不再下载（直接用缓存区已下载的版本），
+    # 所以 download_url / file_suffix 不再是必填（兼容旧调用，传了也不使用）。
+    missing: List[str] = []
+    for key, val in [
+        ("task_id", task_id),
+        ("service_name", service_name),
+        ("version", version),
+    ]:
+        if not val:
+            missing.append(key)
     if missing:
-        logging.error("[显控升级] 参数缺失: %s", ", ".join(missing))
-        return build_result(False, f"参数缺失: {', '.join(missing)}",
-                            error_type="ParameterMissing",
-                            error_message=f"缺少必填参数: {', '.join(missing)}")
+        return _build_result(
+            task_id, False, f"参数缺失: {', '.join(missing)}",
+            error_type="ParameterMissing",
+            error_message=f"缺失参数: {', '.join(missing)}",
+        )
 
-    # ── 3. 组件目录 ──
     if not _DOWNLOAD_BASE:
-        return build_result(False, "config.yaml 中未配置 server.download",
-                            error_type="ConfigMissing", error_message="server.download 未配置")
-    component_dir = os.path.join(_DOWNLOAD_BASE, sub_dir, service_name)
-    if not os.path.isdir(component_dir):
-        logging.error("[显控升级] %s 组件目录不存在: %s", sub_dir, component_dir)
-        return build_result(False, f"服务目录不存在，请先下载安装: {component_dir}",
-                            error_type="FileNotFoundError",
-                            error_message=f"{sub_dir} 组件目录不存在: {component_dir}")
+        return _build_result(
+            task_id, False, "config.yaml 中未配置 server.download",
+            error_type="ConfigMissing",
+            error_message="server.download 未配置",
+        )
 
-    # ── 4. 读当前版本 ──
-    current_version = _read_current_version(component_dir)
-    if not current_version:
-        return build_result(False, "无法读取当前版本号(version 文件缺失或为空)",
-                            error_type="VersionEmpty", error_message="version 文件缺失或为空")
+    if not _APPS_BASE:
+        return _build_result(
+            task_id, False, "config.yaml 中未配置 server.apps 运行区路径",
+            error_type="ConfigMissing",
+            error_message="server.apps 未配置",
+        )
 
-    # ── 5. 版本比对 ──
-    if current_version == version:
-        return build_result(False, f"当前已是目标版本 {version}，无需升级",
-                            error_type="VersionConflict", error_message="当前版本与目标版本相同")
-    target_dir = os.path.join(component_dir, version)
-    if os.path.isdir(target_dir):
-        return build_result(False, f"目标版本目录已存在，请先回滚或卸载: {target_dir}",
-                            error_type="VersionExists",
-                            error_message=f"目标版本 {version} 目录已存在，无法重复升级")
+    # ── 运行区组件目录 ──
+    component_dir = find_apps_component_dir(service_name, _SUB_DIR)
+    steps: List[Dict[str, Any]] = []
 
-    # ── 6. 记录旧版本运行状态（供失败回滚）──
-    was_running = _service_running(component_dir, current_version)
-    logging.info("[显控升级] 当前版本 %s, 目标版本 %s, 旧版本运行中: %s",
-                 current_version, version, was_running)
+    if not component_dir:
+        return _build_result(
+            task_id, False,
+            f"运行区组件不存在: {os.path.join(_APPS_BASE, _SUB_DIR, service_name)}",
+            data={"service_name": service_name, "apps_dir": _APPS_BASE},
+            error_type="AppsComponentNotFound",
+            error_message=f"运行区未找到组件 {service_name}，请先执行安装任务",
+        )
 
-    # ── 7. 停止当前版本 ──
-    logging.info("[显控升级] 停止当前版本 %s", current_version)
-    stop_result = xkt_stop_task({"task_id": task_id, "service_name": service_name, "sub_dir": sub_dir})
-    if not _task_ok(stop_result):
-        logging.error("[显控升级] 停止旧版本失败: %s", stop_result.get("message", ""))
-        return build_result(False, f"停止旧版本失败: {stop_result.get('message', '')}",
-                            error_type="StopError",
-                            error_message=str(stop_result.get("error", {}).get("error_message", ""))
-                            or stop_result.get("message", ""), tb=traceback.format_exc())
+    # ── 新版本号来自任务参数 version（必填，缺失已在上方校验拦截）──
+    new_version = version
 
-    # ── 8. 下载并部署新版本 ──
-    logging.info("[显控升级] 下载新版本 %s", version)
-    download_result = xkt_download_task({
-        "task_id": task_id, "download_url": download_url, "file_name": service_name,
-        "file_suffix": file_suffix, "version": version, "sub_dir": sub_dir,
+    # ── Step 1: 读取当前版本（来自运行状态文件），比对 ──
+    state = read_state(service_name, _SUB_DIR)
+    current_version = str(state.get("version", "") or "").strip()
+
+    logging.info("[xkt_upgrade_task] 当前版本: %s, 新版本: %s", current_version or "(无)", new_version)
+
+    if current_version == new_version:
+        return _build_result(
+            task_id, True, f"版本 {new_version} 正在使用，无需升级",
+            data={
+                "status": "already_uptodate",
+                "service_name": service_name,
+                "version": current_version,
+                "component_dir": component_dir,
+            },
+        )
+
+    # ── Step 2: 校验「缓存区已下载的版本」（不下载）──
+    # 升级入口（平台侧）只允许选节点缓存区里已下载的版本，所以这里只校验目录存在：
+    # 存在 → 继续（Step 3 停旧版 → Step 4 安装）；不存在 → 直接报错，不再自动下载。
+    # ★ 必须放在「停止旧版本」之前：校验失败时旧服务还没被动过，
+    #   不会出现"把旧版本停了、才发现新版本没下载"导致服务停在那儿起不来的情况。
+    cache_version_dir = find_cache_version_dir(service_name, new_version, _SUB_DIR)
+    if not cache_version_dir:
+        available = list_cache_versions(service_name, _SUB_DIR)
+        steps.append({
+            "step": "check_cache",
+            "success": False,
+            "message": f"缓存区未找到版本 {new_version}",
+        })
+        return _build_result(
+            task_id, False,
+            f"版本 {new_version} 未下载到节点，请先执行「下载」任务",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "new_version": new_version,
+                "available_versions": available,
+                "steps": steps,
+            },
+            error_type="VersionNotDownloaded",
+            error_message=f"缓存区中未找到版本 {new_version}，已下载的版本: {available or '无'}",
+        )
+    steps.append({
+        "step": "check_cache",
+        "success": True,
+        "message": f"使用缓存区已下载版本（跳过下载）: {cache_version_dir}",
     })
-    if not _task_ok(download_result):
-        logging.error("[显控升级] 下载新版本失败: %s", download_result.get("message", ""))
-        _rollback(component_dir, current_version, version, task_id, service_name, sub_dir, was_running)
-        return build_result(False, f"下载新版本失败: {download_result.get('message', '')}",
-                            error_type="DownloadError",
-                            error_message=str(download_result.get("error", {}).get("error_message", ""))
-                            or download_result.get("message", ""), tb=traceback.format_exc())
+    logging.info("[xkt_upgrade_task] 跳过下载，直接安装缓存区版本: %s", cache_version_dir)
 
-    # ── 9. 启动新版本 ──
-    logging.info("[显控升级] 启动新版本 %s", version)
-    start_result = xkt_start_task({"task_id": task_id, "service_name": service_name, "sub_dir": sub_dir})
-    if not _task_ok(start_result):
-        logging.error("[显控升级] 启动新版本失败: %s", start_result.get("message", ""))
-        _rollback(component_dir, current_version, version, task_id, service_name, sub_dir, was_running)
-        return build_result(False, f"启动新版本失败，已回滚到 {current_version}: {start_result.get('message', '')}",
-                            error_type="StartError",
-                            error_message=str(start_result.get("error", {}).get("error_message", ""))
-                            or start_result.get("message", ""), tb=traceback.format_exc())
+    # ── Step 3: 停止旧版本服务 ──
+    # 判据与 stop_task 一致：state.runtime 为真且存在存活进程
+    was_running = False   # 回滚标记：旧进程是否原本在运行
+    if current_version:
+        alive_pids = filter_alive_pids(read_state_pids(service_name, _SUB_DIR), service_name)
+        pid_before = ",".join(str(p) for p in alive_pids)
 
-    # ── 10. 刷新 runtime/pid（把旧版本 PID 换成新版本进程 PID）──
-    # xkt_start 内部已按"实际在跑的进程"回写一次，这里再兜底刷新并回传新旧 PID，
-    # 便于现场核对本次升级是否真的把 PID 换掉了
-    old_version_dir = os.path.join(component_dir, current_version)
-    new_version_dir = os.path.join(component_dir, version)
-    old_pids = _read_runtime_pids(old_version_dir)
-    new_pids = collect_service_pids(component_dir, new_version_dir) or old_pids
+        if alive_pids:
+            # 执行运行区的 bin/stop.sh（经 current/bin 软链接）
+            ext = ".bat" if os.name == "nt" else ".sh"
+            bin_dir = os.path.join(component_dir, "bin")
+            stop_script = os.path.join(bin_dir, f"stop{ext}")
 
-    new_pid_file = os.path.join(new_version_dir, "runtime", "pid")
-    pid_written = False
-    if new_pids:
-        try:
-            Path(os.path.dirname(new_pid_file)).mkdir(parents=True, exist_ok=True)
-            with open(new_pid_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(p) for p in new_pids))
-            pid_written = True
-        except Exception as e:
-            logging.warning("[显控升级] 回写 runtime/pid 失败: %s -> %s", new_pid_file, e)
-    logging.info("[显控升级] runtime/pid 已刷新: %s → %s", old_pids, new_pids)
+            if not os.path.isfile(stop_script):
+                return _build_result(
+                    task_id, False,
+                    f"停止脚本不存在，无法停止运行中的旧版本 {current_version}: {stop_script}",
+                    data={"service_name": service_name,
+                          "current_version": current_version,
+                          "new_version": new_version,
+                          "pids": alive_pids, "steps": steps},
+                    error_type="StopScriptNotFound",
+                    error_message=f"停止脚本不存在: {stop_script}",
+                )
 
-    # ── 11. 成功 ──
-    logging.info("[显控升级] 完成: %s %s → %s", service_name, current_version, version)
-    return build_result(True, f"显控升级完成: {service_name} {current_version} → {version}", data={
+            logging.info("[xkt_upgrade_task] 执行停止脚本: %s", stop_script)
+            stop_exec = _execute_script(stop_script, bin_dir, min(timeout, 60))
+            logging.info(
+                "[xkt_upgrade_task] 停止脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+                stop_exec["exit_code"], stop_exec.get("stdout", ""), stop_exec.get("stderr", ""),
+            )
+            steps.append({
+                "step": "stop_old",
+                "success": stop_exec["success"],
+                "message": "停止旧版本服务" + ("成功" if stop_exec["success"] else f"失败 (exit_code={stop_exec['exit_code']})"),
+                "data": {"pid_before": pid_before,
+                         "exit_code": stop_exec["exit_code"],
+                         "stdout": stop_exec.get("stdout", ""),
+                         "stderr": stop_exec.get("stderr", "")},
+            })
+
+            # ── 校验进程是否已销毁（多 PID 逐一检查，starttime 防 PID 复用误判）──
+            pid_start_ticks = {p: _get_process_start_ticks(p) for p in alive_pids}
+            still_alive = [str(p) for p in alive_pids
+                           if _process_exists(p, pid_start_ticks.get(p))]
+            if still_alive:
+                return _build_result(
+                    task_id, False, f"停止旧版本失败: 进程 {', '.join(still_alive)} 仍然存活",
+                    data={"service_name": service_name,
+                          "current_version": current_version,
+                          "new_version": new_version,
+                          "pids": alive_pids, "process_still_alive": True,
+                          "steps": steps},
+                    error_type="ProcessStillAlive",
+                    error_message=f"PID {', '.join(still_alive)} 进程仍然存活，无法升级",
+                )
+
+            logging.info("[xkt_upgrade_task] 旧进程 %s 已销毁", pid_before)
+            was_running = True   # 标记旧进程曾运行，回滚时需要重启
+
+            # 清空运行状态（pids/processes 清空，runtime 置 false）
+            refresh_state_pids(service_name, [], [], _SUB_DIR)
+        else:
+            logging.info("[xkt_upgrade_task] 无存活进程，旧版本未运行，跳过停止步骤")
+            steps.append({
+                "step": "stop_old",
+                "success": True,
+                "message": "旧版本未运行，跳过停止",
+            })
+    else:
+        logging.info("[xkt_upgrade_task] 无当前版本，首次安装，跳过停止步骤")
+        steps.append({
+            "step": "stop_old",
+            "success": True,
+            "message": "无旧版本，跳过停止",
+        })
+
+    # ── Step 4: 安装新版本 ──
+    # install 会重建 current 软链接指向新版本（app/bin/config 保持共存共用）
+    logging.info("[xkt_upgrade_task] 开始安装新版本")
+    install_result = xkt_install_task({
+        "task_id": task_id,
+        "file_name": service_name,
+        "version": new_version,
+        "sub_dir": _SUB_DIR,
+    }, retry=retry, timeout=timeout)
+
+    install_ok = _task_success(install_result)
+    steps.append({
+        "step": "install",
+        "success": install_ok,
+        "message": _task_message(install_result),
+        "data": install_result.get("data", {}),
+    })
+
+    if not install_ok:
+        rollback_info = _rollback(service_name, current_version, new_version, was_running, timeout)
+        return _build_result(
+            task_id, False, f"安装新版本失败，已回滚: {_task_message(install_result)}",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "new_version": new_version,
+                "steps": steps,
+                "rollback": rollback_info,
+            },
+            error_type="UpgradeInstallFailed",
+            error_message=_task_message(install_result),
+        )
+
+    # ── Step 5: 启动新版本（start_task 从运行区 bin/ 读取脚本）──
+    logging.info("[xkt_upgrade_task] 启动新版本服务")
+    start_result = xkt_start_task({
+        "task_id": task_id,
+        "service_name": service_name,
+        "version": new_version,
+        "sub_dir": _SUB_DIR,
+    }, retry=retry, timeout=timeout)
+
+    start_ok = _task_success(start_result)
+    start_data = start_result.get("data", {})
+    steps.append({
+        "step": "start",
+        "success": start_ok,
+        "message": _task_message(start_result),
+        "data": start_data,
+    })
+
+    if not start_ok:
+        rollback_info = _rollback(service_name, current_version, new_version, was_running, timeout)
+        return _build_result(
+            task_id, False, f"启动新版本失败，已回滚: {_task_message(start_result)}",
+            data={
+                "service_name": service_name,
+                "current_version": current_version,
+                "new_version": new_version,
+                "steps": steps,
+                "rollback": rollback_info,
+            },
+            error_type="UpgradeStartFailed",
+            error_message=_task_message(start_result),
+        )
+
+    return _build_result(task_id, True, "升级完成", data={
+        "status": "upgraded",
         "service_name": service_name,
         "old_version": current_version,
-        "new_version": version,
-        "old_pids": old_pids,
-        "new_pids": new_pids,
-        "pid_file": new_pid_file,
-        "pid_written": pid_written,
-        "sub_dir": sub_dir,
+        "new_version": new_version,
         "component_dir": component_dir,
+        "pid": start_data.get("pid", ""),
+        "steps": steps,
     })
 
 
 # ── 自测入口 ──
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    import json
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if os.name == "nt":
+        test_start_script = (
+            "@echo off\n"
+            "chcp 65001 >nul\n"
+            "setlocal enabledelayedexpansion\n"
+            'set "RUNTIME_DIR=%~dp0..\\runtime"\n'
+            'if not exist "!RUNTIME_DIR!" mkdir "!RUNTIME_DIR!"\n'
+            'powershell -Command "$p=Start-Process -FilePath \'cmd\' -ArgumentList \'/c ping -n 6 127.0.0.1 > nul\' -WindowStyle Hidden -PassThru; $p.Id | Out-File -FilePath \'!RUNTIME_DIR!\\pid\' -Encoding ascii -NoNewline"\n'
+            "exit /b 0\n"
+        )
+    else:
+        test_start_script = (
+            "#!/bin/bash\n"
+            "set -e\n"
+            'BIN_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            'RUNTIME_DIR="$BIN_DIR/../runtime"\n'
+            'mkdir -p "$RUNTIME_DIR"\n'
+            "sleep 5 &\n"
+            'echo $! > "$RUNTIME_DIR/pid"\n'
+            "exit 0\n"
+        )
+
+    if os.name == "nt":
+        test_stop_script = (
+            "@echo off\n"
+            "chcp 65001 >nul\n"
+            "setlocal enabledelayedexpansion\n"
+            'set "RUNTIME_DIR=%~dp0..\\runtime"\n'
+            'set "PID_FILE=!RUNTIME_DIR!\\pid"\n'
+            'if exist "!PID_FILE!" (\n'
+            '    set /p PID=<"!PID_FILE!"\n'
+            '    taskkill /PID !PID! /F >nul 2>&1\n'
+            '    del "!PID_FILE!" 2>nul\n'
+            ")\n"
+            "exit /b 0\n"
+        )
+    else:
+        test_stop_script = (
+            "#!/bin/bash\n"
+            "set -e\n"
+            'BIN_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            'RUNTIME_DIR="$BIN_DIR/../runtime"\n'
+            'PID_FILE="$RUNTIME_DIR/pid"\n'
+            'if [ -f "$PID_FILE" ]; then\n'
+            '    PID=$(cat "$PID_FILE")\n'
+            '    kill "$PID" 2>/dev/null || true\n'
+            '    rm -f "$PID_FILE"\n'
+            "fi\n"
+            "exit 0\n"
+        )
+
     result = xkt_upgrade_task({
-        "task_id": "test-xkt-upgrade-001",
-        "service_name": "test-service",
-        "download_url": "http://127.0.0.1:8099/nginx-ruoyi-v2.zip",
-        "file_suffix": "zip",
-        "version": "v2",
+        "task_id": "test-upgrade-001",
+        "service_name": "hellogitworld-master",
+        "version": "2.0.0",
+        "script": test_start_script,
+        "stop_script": test_stop_script,
+        "download_url": "https://github.com/githubtraining/hellogitworld/archive/refs/heads/master.zip",
+        "file_suffix": ".zip",
+        "displayName": "Hello Git World v2",
+        "description": "升级测试",
+        "serviceName": "radar-service",
+        "groupName": "DEFAULT_GROUP",
+        "clusterName": "DEFAULT",
+        "weight": 1.0,
+        "healthy": True,
+        "enabled": True,
+        "ephemeral": True,
+        "metadata": {"version": "2.0", "protocol": "http"},
     })
+
     print("\n" + "=" * 60)
-    print("  显控升级任务结果")
+    print("  升级任务结果")
     print("=" * 60)
     print(f"  task_id : {result.get('task_id', '')}")
-    print(f"  成功    : {result['result']}")
+    print(f"  成功    : {result['success']}")
     print(f"  消息    : {result['message']}")
+    data = result.get("data", {})
+    if data:
+        for key in ("service_name", "old_version", "new_version", "status", "pid"):
+            print(f"  {key}: {data.get(key, 'N/A')}")
+    steps = data.get("steps", [])
+    if steps:
+        print("\n  步骤详情:")
+        for s in steps:
+            status = "OK" if s.get("success") else "FAIL"
+            print(f"  [{status}] {s.get('step')}: {s.get('message')}")
+    if not result["success"]:
+        err = result.get("error", {})
+        print(f"  错误类型: {err.get('error_type', '')}")
+        print(f"  错误信息: {err.get('error_message', '')}")
     print("=" * 60)

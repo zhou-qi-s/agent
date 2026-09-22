@@ -35,6 +35,9 @@ def _build_result(
 ) -> Dict[str, Any]:
     return {
         "success": success,
+        # 顶层状态码（平台约定）: 3=已启动 / 7=升级失败
+        # 本任务对应平台按钮"修改版本"（TaskTypeEnum.CONTAINER_RESTART），
+        # 实际执行 helm upgrade --install，失败态用 7（升级失败）是对的，勿改成 4/14
         "status": 3 if success else 7,
         "task_id": task_id,
         "task_type": "container_restart",
@@ -460,4 +463,3 @@ if __name__ == "__main__":
         print(f"  错误类型 : {err.get('error_type', '')}")
         print(f"  错误信息 : {err.get('error_message', '')}")
     print("=" * 60)
-

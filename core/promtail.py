@@ -77,7 +77,7 @@ def generate_promtail_config():
     """
     host = _get_host()
     scrape_configs = []
-    for path in _PATHS:
+    for path_idx, path in enumerate(_PATHS):
         labels = {
             "job": _JOB,
             "host": host,
@@ -102,8 +102,13 @@ def generate_promtail_config():
         elif _NAMESPACE:
             labels["namespace"] = _NAMESPACE
 
+        # ⚠️ job_name 必须唯一：promtail 不允许两个 scrape_config 用同一个 job_name，
+        #    否则启动即报 "found multiple scrape configs with job name ..." 并拒绝运行
+        #    （而这里是【每个 path 生成一个 scrape_config】，所以 log_collect.paths 配多个时必然撞）。
+        #    单路径时保持原名 "app-logs" 以兼容旧行为；多路径时加序号。
+        #    注意：对外可见的 job 标签仍是 static_configs.labels.job（= log_collect.job），不受这里影响。
         scrape_config = {
-            "job_name": "app-logs",
+            "job_name": "app-logs" if len(_PATHS) <= 1 else "app-logs-%d" % (path_idx + 1),
             "static_configs": [{
                 "targets": ["localhost"],
                 "labels": labels,

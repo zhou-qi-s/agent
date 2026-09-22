@@ -35,7 +35,10 @@ export CLCACHE_DISABLE=1
 echo "[INFO] 安装/升级打包依赖..."
 "$PYTHON_BIN" -m pip install -U pip --disable-pip-version-check
 "$PYTHON_BIN" -m pip install -r requirements.txt --disable-pip-version-check
-"$PYTHON_BIN" -m pip install -U nuitka ordered-set zstandard httptools anyio h11 --disable-pip-version-check
+# 注意：不能对 anyio/h11/httptools 用 -U —— requirements.txt 里 fastapi 0.104.1 要求
+# anyio<4.0.0，而 -U 会拉到 anyio 4.x，导致 Redis/HTTP 相关行为异常（实测 redis 连接失败）。
+"$PYTHON_BIN" -m pip install nuitka ordered-set zstandard --disable-pip-version-check
+"$PYTHON_BIN" -m pip install "anyio<4.0.0" httptools h11 --disable-pip-version-check
 
 echo "[INFO] 开始 Nuitka 打包..."
 "$PYTHON_BIN" -m nuitka \

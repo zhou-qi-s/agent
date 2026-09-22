@@ -1,7 +1,9 @@
 """
 节点级别资源采集和告警模块
 
-- 节点资源采集（CPU/内存/IO），写入 download/node/runtime/resources.txt
+- 节点资源采集（CPU/内存/IO），写入 {server.apps}/node/runtime/resources.txt
+  （改造后从「缓存区」移到「运行区」，与各应用服务的产物落点保持一致；
+    缓存区可被清理，节点运行数据不应放在那里）
 - 节点告警检测，从 Redis alarm:node:{ip} 读取阈值并对比上报
 """
 
@@ -29,11 +31,24 @@ from utils.logger import logger
 # 配置
 # =========================================================
 
+# 节点资源数据的伪服务名（在运行区下表现为一个虚拟服务目录）
+_NODE_SERVICE_NAME = "node"
 
-_NODE_IO_BASELINE = {}
-def _get_download_base() -> str:
+
+def _get_apps_base() -> str:
+    """
+    获取运行区根目录（config.yaml 的 server.apps）。
+
+    注意：原实现读的是顶层 `download.base` 键（与项目其它模块的
+    `server.download` 不一致），改造后统一从 server.apps 取。
+    """
     config = load_config()
-    return config.get("download", {}).get("base", "/var/cache/agent/download")
+    return config.get("server", {}).get("apps", "/var/cache/agent/apps")
+
+
+def _get_node_dir() -> str:
+    """节点资源目录：{server.apps}/node/runtime"""
+    return os.path.join(_get_apps_base(), _NODE_SERVICE_NAME, "runtime")
 
 
 # =========================================================
@@ -52,15 +67,8 @@ def collect_node_resources() -> Dict[str, Any]:
     mem = psutil.virtual_memory()
     mem_used_mb = mem.used / (1024 * 1024)
 
-    # IO delta(MB): current cumulative - previous cumulative
-    _io_cnt = psutil.disk_io_counters()
-    _cur_bytes = (_io_cnt.read_bytes + _io_cnt.write_bytes) if _io_cnt else 0
-    _prev = _NODE_IO_BASELINE.get("total_bytes")
-    if _prev is None:
-        io_total_mb = 0.0
-    else:
-        io_total_mb = max(_cur_bytes - _prev, 0) / (1024 * 1024)
-    _NODE_IO_BASELINE["total_bytes"] = _cur_bytes
+    io_counters = psutil.disk_io_counters()
+    io_total_mb = (io_counters.read_bytes + io_counters.write_bytes) / (1024 * 1024)
 
     return {
         "pid": "node",
@@ -76,7 +84,7 @@ def write_node_resources_file(node_dir: str, resources: Dict[str, Any]) -> None:
     将节点资源写入 resources.txt，格式与应用级一致。
 
     Args:
-        node_dir:  download/node/runtime 目录路径
+        node_dir:  {server.apps}/node/runtime 目录路径
         resources: collect_node_resources() 的返回值
     """
     os.makedirs(node_dir, exist_ok=True)
@@ -146,8 +154,7 @@ def read_node_resources(filepath: str) -> Optional[Dict[str, float]]:
 
 def collect_and_write_node_resources() -> None:
     """采集节点资源并写入文件（对外接口）"""
-    download_base = _get_download_base()
-    node_dir = os.path.join(download_base, "node", "runtime")
+    node_dir = _get_node_dir()
     resources = collect_node_resources()
     write_node_resources_file(node_dir, resources)
     logger.info("[NODE-RESOURCE] 采集完成: cpu=%.1f mem=%.1f io=%.1f",
@@ -193,11 +200,11 @@ def read_node_alarm_from_redis() -> Dict[str, Any]:
         return {}
 
 
-def _can_report_node_alarm(dimension: str) -> bool:
+def _can_report_node_alarm(alarm_type: int) -> bool:
     """节点告警冷却检查"""
     current_time = time.time()
     ip = get_local_ip()
-    key = f"node_{ip}_{dimension}"
+    key = f"node_{ip}_{alarm_type}"
 
     last_time = last_alarm_time.get(key)
     if not last_time:
@@ -210,7 +217,7 @@ def _can_report_node_alarm(dimension: str) -> bool:
         return True
 
     logger.info("[NODE-ALARM] 节点告警冷却中: type=%s 距上次 %.0f 秒 (需要 %d 秒)",
-                dimension, elapsed, ALARM_COOLDOWN)
+                alarm_type, elapsed, ALARM_COOLDOWN)
     return False
 
 
@@ -222,8 +229,7 @@ def check_and_report_node_alarms() -> Optional[list]:
     3. 对比并上报告警
     """
     ip = get_local_ip()
-    download_base = _get_download_base()
-    node_dir = os.path.join(download_base, "node", "runtime")
+    node_dir = _get_node_dir()
     filepath = os.path.join(node_dir, "resources.txt")
 
     # 读取阈值
@@ -264,7 +270,7 @@ def check_and_report_node_alarms() -> Optional[list]:
     # ---- CPU 告警 ----
     if cpu_threshold >= 0 and cpu_val > cpu_threshold:
         logger.info("[NODE-ALARM] CPU告警触发: %.1f > %.1f", cpu_val, cpu_threshold)
-        if _can_report_node_alarm("cpu"):
+        if _can_report_node_alarm(NODE_ALARM_TYPE):
             report_alarm(
                 alarm_type=NODE_ALARM_TYPE,
                 service_name=f"node:{ip}",
@@ -278,7 +284,7 @@ def check_and_report_node_alarms() -> Optional[list]:
     # ---- 内存告警 ----
     if memory_threshold >= 0 and mem_val > memory_threshold:
         logger.info("[NODE-ALARM] 内存告警触发: %.1f > %.1f", mem_val, memory_threshold)
-        if _can_report_node_alarm("memory"):
+        if _can_report_node_alarm(NODE_ALARM_TYPE):
             report_alarm(
                 alarm_type=NODE_ALARM_TYPE,
                 service_name=f"node:{ip}",
@@ -292,7 +298,7 @@ def check_and_report_node_alarms() -> Optional[list]:
     # ---- IO 告警 ----
     if io_threshold >= 0 and io_val > io_threshold:
         logger.info("[NODE-ALARM] IO告警触发: %.1f > %.1f", io_val, io_threshold)
-        if _can_report_node_alarm("io"):
+        if _can_report_node_alarm(NODE_ALARM_TYPE):
             report_alarm(
                 alarm_type=NODE_ALARM_TYPE,
                 service_name=f"node:{ip}",

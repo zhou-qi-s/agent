@@ -24,6 +24,15 @@ import yaml
 from utils import util
 from utils.config_loader import load_config
 
+# 复用虚拟机下载的元信息解析与目录归位逻辑，保证三类应用（虚拟机/插件/显控台）
+# 的落地结构完全一致，避免三份重复实现产生行为差异。
+from core.task_utils.download import (
+    read_app_meta,
+    reorganize_to_standard_layout,
+    cleanup_dir,
+    write_app_id,
+)
+
 
 # ── YAML flow-style 辅助类：使内层 dict 输出为紧凑的 {} 格式 ──
 class FlowDict(dict):
@@ -201,31 +210,8 @@ def _build_download_result(
 # =============================================================================
 # 读取 runtime/config.yaml
 # =============================================================================
-
-def _read_runtime_config(save_path: str, file_name: str, sub_dir: str = "displayConsole") -> Dict[str, Any]:
-    """
-    从 {save_path}/{sub_dir}/{file_name}/runtime/config.yaml 读取服务版本和 Nacos 配置。
-
-    注意: xkt_download.py 不再调用此函数（下载前该文件尚不存在，version 由参数显式传入）。
-    保留该函数仅因为其他模块可能 import 使用。
-
-    返回:
-        解析后的配置字典，文件不存在或读取失败返回空 dict
-    """
-    config_path = os.path.join(save_path, sub_dir, file_name, "runtime", "config.yaml")
-    if not os.path.isfile(config_path):
-        logging.warning("[显控下载] runtime/config.yaml 不存在: %s", config_path)
-        return {}
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        logging.info("[显控下载] 已从 runtime/config.yaml 读取配置: %s", config_path)
-        return config if isinstance(config, dict) else {}
-    except Exception as e:
-        logging.error("[显控下载] 读取 runtime/config.yaml 失败: %s -> %s", config_path, e)
-        return {}
-
+# 注：原 _read_runtime_config() 已删除。
+#     相关逻辑在新架构中已失效（详见 download.py 同类说明），且无调用方。
 
 # =============================================================================
 # 参数校验
@@ -293,6 +279,8 @@ def _validate_and_extract_params(parameters: Dict[str, Any]) -> tuple:
         'file_name': custom_file_name,
         'file_suffix': file_suffix,
         'version': version,
+        # 平台下发的应用记录 ID（写入包内 config/app.yaml，键名 appId）
+        'app_id': str(parameters.get('app_id', '') or '').strip(),
     }
 
     return None, params
@@ -380,63 +368,12 @@ def _prepare_download_environment(
     if os.listdir(version_dir):
         logging.info(f"[显控下载] 版本目录下已有文件，将直接覆盖重新下载: {version_dir}")
 
-    # 写入版本文件
-    version_file = os.path.join(save_dir, "version")
-    try:
-        with open(version_file, "w", encoding="utf-8") as vf:
-            vf.write(version)
-    except Exception as e:
-        logging.error(f"[显控下载] 写入版本文件失败: {e}")
-        return (
-            _build_download_result(task_id, False, f"写入版本文件失败: {e}",
-                                   error_type="VersionFileWriteError", error_message=str(e)),
-            "", ""
-        )
-
     logging.info(f"[显控下载] 创建版本目录: {version_dir}")
 
-    # ── 构建 platform 节点（来源为全局 config.yaml，与组件无关）──
-    platform_cfg = {}
-    if _SERVER_IP:
-        platform_cfg["host"] = _SERVER_IP
-    if _SERVER_PORT:
-        try:
-            platform_cfg["port"] = int(_SERVER_PORT)
-        except (ValueError, TypeError):
-            logging.warning(f"[显控下载] server.port 不是有效整数: {_SERVER_PORT}，已忽略")
-    if _INTERFACE_REGISTER_URL:
-        platform_cfg["registerUrl"] = _INTERFACE_REGISTER_URL
-    if _INTERFACE_DEREGISTER_URL:
-        platform_cfg["deregisterUrl"] = _INTERFACE_DEREGISTER_URL
-    if not platform_cfg:
-        logging.warning("[显控下载] platform 配置缺失，application.yml 将不包含 platform 节点")
-    if not _SERVER_IP:
-        logging.warning("[显控下载] server.ip 未配置，platform.host 将缺失")
-
-    # ── 拼装 application.yml 内容（不读 runtime/config.yaml，nacos 节点由后续注册流程补充）──
-    app_yml_content = {
-        "component": {
-            "name": file_name,
-            "displayName": file_name,
-            "version": version,
-            "type": "MASTER",
-            "description": "",
-        },
-    }
-    if platform_cfg:
-        app_yml_content["platform"] = platform_cfg
-    app_yml_path = os.path.join(version_dir, "application.yml")
-    try:
-        with open(app_yml_path, "w", encoding="utf-8") as yf:
-            yaml.dump(app_yml_content, yf, allow_unicode=True, default_flow_style=False, sort_keys=False)
-        logging.info(f"[显控下载] 生成组件描述文件: {app_yml_path}")
-    except Exception as e:
-        logging.error(f"[显控下载] 生成 application.yml 失败: {e}")
-        return (
-            _build_download_result(task_id, False, f"生成 application.yml 失败: {e}",
-                                   error_type="AppYmlWriteError", error_message=str(e)),
-            "", ""
-        )
+    # ── 不再生成 version 文件与 application.yml ──
+    # 下载区仅作「缓存」：只落应用包解压后的原始内容（app/ bin/ config/）。
+    # 版本信息由 {save_dir}/{version}/ 目录名体现；
+    # 运行状态与 Nacos 配置改由 install 阶段在「运行区」生成。
 
     return None, save_dir, version_dir
 
@@ -631,58 +568,8 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
     except Exception as e:
         logging.error("[显控下载] 解压失败: %s -> %s: %s", archive_path, dest_dir, e)
         return False
-
-
-def _strip_single_top_dir(dest_dir: str) -> None:
-    """
-    剥离解压目录中多余的单一顶层目录。
-
-    组件压缩包常见结构为顶层带一个与组件同名的目录（如 ruoyi/），
-    解压后为 dest_dir/ruoyi/{bin,app,config,...}。而 install/start/stop/
-    uninstall 等任务统一按 {component_dir}/{version}/bin/ 定位脚本，
-    因此需将顶层目录内容提升到 dest_dir 根。
-
-    仅当 dest_dir 下「恰好只有一个子目录、无其他顶层文件」时才剥离，避免误伤
-    本来就是扁平结构的压缩包。下载流程会预先在 dest_dir 根生成 application.yml
-    （组件描述文件），剥离时需将其排除，且不覆盖已存在的同名文件。
-
-    若唯一顶层目录名本身就是 bin（压缩包扁平结构，bin 已在最外层），则跳过剥离，
-    否则 bin 被提升掉后，install/start/stop 按 {version}/bin/ 定位脚本将失败。
-    """
-    try:
-        entries = os.listdir(dest_dir)
-    except OSError as e:
-        logging.warning("[显控下载] 检查顶层目录失败: %s: %s", dest_dir, e)
-        return
-    subdirs = [e for e in entries if os.path.isdir(os.path.join(dest_dir, e))]
-    # application.yml 为下载流程预生成的组件描述文件，不属于压缩包内容，排除
-    files = [
-        e for e in entries
-        if os.path.isfile(os.path.join(dest_dir, e)) and e != "application.yml"
-    ]
-    if len(subdirs) == 1 and not files:
-        top_dir = subdirs[0]
-        if top_dir.strip().lower() == "bin":
-            logging.info("[显控下载] 顶层目录为 bin，属扁平结构，跳过剥离: %s", dest_dir)
-            return
-        top_path = os.path.join(dest_dir, top_dir)
-        logging.info("[显控下载] 检测到压缩包单一顶层目录: %s, 剥离并提升内容到: %s",
-                     top_dir, dest_dir)
-        for name in os.listdir(top_path):
-            src = os.path.join(top_path, name)
-            dst = os.path.join(dest_dir, name)
-            if os.path.exists(dst):
-                logging.warning("[显控下载] 提升时跳过已存在的同名路径: %s", dst)
-                continue
-            try:
-                os.replace(src, dst)
-            except Exception as e:
-                logging.error("[显控下载] 提升文件失败 %s -> %s: %s", src, dst, e)
-        try:
-            os.rmdir(top_path)
-        except OSError:
-            pass
-
+# 注：原 _strip_single_top_dir() 已删除。
+#     相关逻辑在新架构中已失效（详见 download.py 同类说明），且无调用方。
 
 # =============================================================================
 # 显控下载任务（主入口）
@@ -755,54 +642,110 @@ def xkt_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int =
     else:
         logging.info("[显控下载] Windows系统，跳过token认证")
 
-    # ── 5. 拼接文件名并下载到版本目录 ──
+    # ── 5. 拼接文件名并下载到临时位置 ──
+    # 与虚拟机/插件下载一致：先下到临时目录，解压读出 app.yaml 的 name/version 后再归位。
     if not file_suffix.startswith('.'):
         file_suffix = '.' + file_suffix
     file_name_with_suffix = file_name + file_suffix
-    target_file_path = os.path.join(version_dir, file_name_with_suffix)
+
+    staging_dir = os.path.join(save_path, ".staging", f"{sub_dir}-{file_name}-{int(time.time())}")
+    try:
+        os.makedirs(staging_dir, exist_ok=True)
+    except Exception as e:
+        return _build_download_result(task_id, False,
+                                      f"创建临时目录失败: {e}",
+                                      data={"staging_dir": staging_dir},
+                                      error_type="StagingDirError", error_message=str(e))
+    target_file_path = os.path.join(staging_dir, file_name_with_suffix)
 
     logging.info(f"[显控下载] 下载文件: {params['download_url']} -> {target_file_path}"
                  f", 重试: {retry}, 超时: {timeout}s")
 
     result = _download_file(task_id, params['download_url'], target_file_path, retry, timeout, token)
+    if not result.get("result"):
+        cleanup_dir(staging_dir)
+        result['data'] = {
+            "download_url": params['download_url'],
+            "save_path": save_path,
+            "file_name": file_name_with_suffix,
+            **result.get('data', {}),
+            **_build_service_data(file_name, version)
+        }
+        return result
 
-    # ── 6. 下载成功后解压到版本目录 ──
-    if result.get("result"):
-        extract_ok = _extract_archive(target_file_path, version_dir)
-        if extract_ok:
-            # 解压成功后删除压缩包
-            try:
-                os.remove(target_file_path)
-                logging.info("[显控下载] 已删除压缩包: %s", target_file_path)
-            except Exception as rm_err:
-                logging.warning("[显控下载] 删除压缩包失败: %s", rm_err)
-            # 剥离压缩包单一顶层目录（如 ruoyi/），使 install/start/stop 等按
-            # {displayConsole}/{file_name}/{version}/bin/ 定位生效
-            _strip_single_top_dir(version_dir)
-            result['data']["status"] = "downloaded_and_extracted"
-            result['data']["extracted_dir"] = version_dir
-        else:
-            result = _build_download_result(task_id, False,
-                                            f"解压失败: {target_file_path}",
-                                            data={
-                                                "download_url": params['download_url'],
-                                                "save_path": save_path,
-                                                "file_name": file_name_with_suffix,
-                                                "file_path": target_file_path,
-                                                "version_dir": version_dir,
-                                                **_build_service_data(file_name, version)
-                                            },
-                                            error_type="ExtractError",
-                                            error_message="下载成功但解压失败，请检查压缩包格式")
-            return result
+    # ── 6. 解压到临时目录 ──
+    extract_dir = os.path.join(staging_dir, "extract")
+    if not _extract_archive(target_file_path, extract_dir):
+        cleanup_dir(staging_dir)
+        return _build_download_result(task_id, False,
+                                      f"解压失败: {target_file_path}",
+                                      data={
+                                          "download_url": params['download_url'],
+                                          "save_path": save_path,
+                                          "file_name": file_name_with_suffix,
+                                          "file_path": target_file_path,
+                                          **_build_service_data(file_name, version)
+                                      },
+                                      error_type="ExtractError",
+                                      error_message="下载成功但解压失败，请检查压缩包格式")
 
-    # 合并通用数据和服务数据到返回结果
+    # 解压成功即可删除压缩包
+    try:
+        os.remove(target_file_path)
+        logging.info("[显控下载] 已删除压缩包: %s", target_file_path)
+    except Exception as rm_err:
+        logging.warning("[显控下载] 删除压缩包失败: %s", rm_err)
+
+    # ── 7. 从 app.yaml 读取权威的应用名与版本号 ──
+    meta = read_app_meta(extract_dir)
+    meta_name = meta.get("name", "")
+    meta_version = meta.get("version", "")
+    # 应用名与版本号一律以「平台下发参数」为准，不用 app.yaml 覆盖。
+    # 原因：后续 install/start/stop/upgrade/uninstall 均用平台的应用名与版本号
+    #       定位目录（见 InstanceServiceImpl 各任务均取 app.getAppName()），
+    #       此处若按 app.yaml 改名会导致定位失败（下载落地 nacos/、安装找 nacos-xkt/）。
+    if meta_name and meta_name != file_name:
+        logging.warning("[显控下载] app.yaml 应用名(%s) 与平台应用名(%s) 不一致，"
+                        "以平台为准归位", meta_name, file_name)
+    if meta_version and meta_version != version:
+        logging.warning("[显控下载] app.yaml 版本号(%s) 与平台版本号(%s) 不一致，"
+                        "以平台为准归位", meta_version, version)
+    final_name = file_name
+    final_version = version
+
+    # ── 8. 归位到 {download}/{sub_dir}/{name}/{version}/ ──
+    try:
+        final_version_dir = reorganize_to_standard_layout(
+            extract_dir, save_path, final_name, final_version, sub_dir
+        )
+    except Exception as e:
+        logging.error("[显控下载] 归位失败: %s", e, exc_info=True)
+        cleanup_dir(staging_dir)
+        return _build_download_result(task_id, False,
+                                      f"整理目录结构失败: {e}",
+                                      data={
+                                          "download_url": params['download_url'],
+                                          "save_path": save_path,
+                                          "extract_dir": extract_dir,
+                                          **_build_service_data(file_name, version)
+                                      },
+                                      error_type="ReorganizeError", error_message=str(e),
+                                      tb=traceback.format_exc())
+
+    cleanup_dir(staging_dir)
+
+    # ── 9. 下载成功：把平台下发的应用记录 ID 写入包内 config/app.yaml（键名 appId）──
+    write_app_id(final_version_dir, params.get("app_id"))
+
+    result['data']["status"] = "downloaded_and_extracted"
+    result['data']["extracted_dir"] = final_version_dir
+    # 合并通用数据和服务数据到返回结果（服务信息以 app.yaml 解析结果为准）
     result['data'] = {
         "download_url": params['download_url'],
         "save_path": save_path,
         "file_name": file_name_with_suffix,
         **result.get('data', {}),
-        **_build_service_data(file_name, version)
+        **_build_service_data(final_name, final_version)
     }
     return result
 

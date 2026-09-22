@@ -34,7 +34,7 @@ def _build_result(
 ) -> Dict[str, Any]:
     return {
         "success": success,
-        "status": 5 if success else 3,
+        "status": 5 if success else 14,
         "task_id": task_id,
         "task_type": "container_stop",
         "message": message,
@@ -301,4 +301,3 @@ if __name__ == "__main__":
         print(f"  错误类型 : {err.get('error_type', '')}")
         print(f"  错误信息 : {err.get('error_message', '')}")
     print("=" * 60)
-

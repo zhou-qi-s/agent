@@ -1,8 +1,14 @@
 """
-插件应用停止服务任务模块
+停止服务任务模块
 
-与 stop.py 结构完全对齐，唯一区别：
-  路径多一层 plugin/
+与 stop.py 结构完全对齐，唯一区别：路径多一层 plugin/（由 _SUB_DIR 承载）。
+
+在「运行区」定位组件并执行其 bin/stop.sh 停止脚本。
+
+缓存区/运行区分离后：
+    · 组件定位 → {server.apps}/{service_name}/（install 建立的软链接结构）
+    · pid 来源 → state/config.yaml 的 pids 数组（原为 {版本}/runtime/pid）
+    · 停止后校验进程是否真的退出，成功则清空状态（pids=[] / runtime=false）
 """
 
 import logging
@@ -11,11 +17,26 @@ import subprocess
 import time
 from typing import Any, Dict, Optional
 
+from utils.app_path import (
+    SUB_DIR_PLUGIN,
+    find_apps_component_dir,
+    read_state,
+    read_state_pids,
+    refresh_state_pids,
+    get_pid_file,
+)
 from utils.config_loader import load_config
 
 # ── 全局配置 ──
 _CONFIG = load_config()
-_DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 本模块处理的应用类别（决定路径中的分层目录）
+_SUB_DIR = SUB_DIR_PLUGIN
+
+# 停止后校验进程退出的重试次数（每次间隔 1 秒）
+# JVM 等进程收到 SIGTERM 后需要数秒优雅退出，不能执行完立即判定
+STOP_CONFIRM_RETRY = 10
 
 
 # =============================================================================
@@ -35,14 +56,15 @@ def _build_result(
         "success": success,
         "task_id": task_id,
         "task_type": "plugin_stop",
-        "status": 5 if success else 6,
+        # 5=已停止 / 14=停止失败（原为 6，6 在平台枚举里是“升级中”）
+        "status": 5 if success else 14,
         "message": message,
         "data": data or {},
         "error": (
             {}
             if success
             else {
-                "error_type": error_type or "PluginStopTaskError",
+                "error_type": error_type or "StopTaskError",
                 "error_message": error_message or message,
                 "traceback": tb,
             }
@@ -50,66 +72,52 @@ def _build_result(
     }
 
 
-def _resolve_paths(service_name: str, sub_dir: str = "plugin") -> tuple:
+def _resolve_paths(service_name: str) -> tuple:
     """
-    根据 service_name 解析组件路径（多一层 plugin）。
+    在运行区解析组件路径。
 
     返回:
         (error, component_dir, version, bin_dir)
         - 出错: (error_result, "", "", "")
-        - 正常: (None, component_dir, version, bin_dir)
+        - 正常: (None, 运行区组件目录, version, 运行区 bin 目录)
     """
-    if not _DOWNLOAD_BASE:
+    if not _APPS_BASE:
         return (
             _build_result(
-                "", False, "config.yaml 中未配置 server.download",
+                "", False, "config.yaml 中未配置 server.apps 运行区路径",
                 error_type="ConfigMissing",
-                error_message="server.download 未配置",
+                error_message="server.apps 未配置",
             ),
             "", "", "",
         )
 
-    component_dir = os.path.join(_DOWNLOAD_BASE, sub_dir, service_name)
-    if not os.path.isdir(component_dir):
+    # 在运行区定位组件目录
+    component_dir = find_apps_component_dir(service_name, _SUB_DIR)
+    if not component_dir:
         return (
             _build_result(
-                "", False, f"{sub_dir} 组件目录不存在: {component_dir}",
-                error_type="FileNotFoundError",
-                error_message=f"{sub_dir} 组件目录不存在: {component_dir}",
+                "", False, f"运行区组件不存在: {os.path.join(_APPS_BASE, _SUB_DIR, service_name)}",
+                error_type="AppsComponentNotFound",
+                error_message=f"运行区未找到组件 {service_name}，请先执行安装任务",
             ),
             "", "", "",
         )
 
-    # 读取 version
-    version_file = os.path.join(component_dir, "version")
-    if not os.path.isfile(version_file):
-        return (
-            _build_result(
-                "", False, f"version 文件不存在: {version_file}",
-                error_type="FileNotFoundError",
-                error_message="未找到 version 文件，请确认组件已下载",
-            ),
-            "", "", "",
-        )
-    try:
-        with open(version_file, "r", encoding="utf-8") as vf:
-            version = vf.read().strip()
-    except Exception as e:
-        return (
-            _build_result("", False, f"读取 version 失败: {e}",
-                          error_type="VersionReadError", error_message=str(e)),
-            "", "", "",
-        )
+    # 版本号来自运行状态文件
+    state = read_state(service_name, _SUB_DIR)
+    version = str(state.get("version", "") or "").strip()
     if not version:
         return (
-            _build_result("", False, "version 文件为空",
-                          error_type="VersionEmpty", error_message="version 文件为空"),
+            _build_result(
+                "", False, "运行状态中 version 字段为空",
+                error_type="VersionMissing",
+                error_message="state/config.yaml 中未记录版本号，无法定位停止脚本",
+            ),
             "", "", "",
         )
 
-    # bin 目录: {component_dir}/{version}/bin/
-    bin_dir = os.path.join(component_dir, version, "bin")
-    os.makedirs(bin_dir, exist_ok=True)
+    # bin 目录：{apps}/{service_name}/bin（指向 current/bin 的软链接）
+    bin_dir = os.path.join(component_dir, "bin")
 
     return None, component_dir, version, bin_dir
 
@@ -127,14 +135,16 @@ def _get_process_start_ticks(pid: int) -> Optional[int]:
         with open(f"/proc/{pid}/stat", "r") as f:
             stat = f.read().strip()
         # /proc/pid/stat 格式: "pid (comm) state ... starttime ..."
-        # starttime 是 comm 之后的第 21 个字段 (0-indexed: 20)
+        # starttime 在 comm 之后为 0-indexed: 19
+        # （原始 1-indexed 第 22 个字段，减去 pid/comm 两项偏移）
+        # 先按 ')' 分割，右边是 state 及之后的字段
         parts = stat.rsplit(")", 1)
         if len(parts) != 2:
             return None
         fields = parts[1].split()
-        if len(fields) < 21:
+        if len(fields) < 20:
             return None
-        return int(fields[20])  # starttime, 单位为时钟滴答(通常 100Hz)
+        return int(fields[19])  # starttime, 单位为时钟滴答(通常 100Hz)
     except (OSError, FileNotFoundError, ValueError):
         return None
 
@@ -150,13 +160,14 @@ def _is_zombie_or_dead(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", "r") as f:
             stat = f.read().strip()
+        # 格式: "pid (comm) state ..."
         parts = stat.rsplit(")", 1)
         if len(parts) != 2:
             return False
         fields = parts[1].split()
         if len(fields) == 0:
             return False
-        state = fields[0]
+        state = fields[0]  # 第一个字段是进程状态
         return state in ("Z", "z", "X", "x")
     except (OSError, FileNotFoundError):
         return False
@@ -185,15 +196,23 @@ def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> boo
             # ── 检查1: 僵尸/已死亡进程视为已停止 ──
             if _is_zombie_or_dead(pid):
                 logging.info(
-                    "[plugin_stop] PID %d 处于僵尸/死亡态，判定为已停止", pid
+                    "[plugin_stop_task] PID %d 处于僵尸/死亡态，判定为已停止", pid
                 )
                 return False
-            # ── 检查2: PID 回收 → starttime 已变化 ──
+            # ── 检查2: starttime 比对 ──
+            # 若提供了期望值，则读不到 starttime 说明 /proc/{pid}/stat 已不可读
+            # （进程正在消失），同样判定为已停止；读到但值不同说明 PID 被复用。
             if expected_start_ticks is not None:
                 current_start = _get_process_start_ticks(pid)
-                if current_start is not None and current_start != expected_start_ticks:
+                if current_start is None:
+                    logging.info(
+                        "[plugin_stop_task] PID %d 的 starttime 已不可读（进程正在退出），"
+                        "判定为已停止", pid,
+                    )
+                    return False
+                if current_start != expected_start_ticks:
                     logging.warning(
-                        "[plugin_stop] PID %d 启动时间已变化 (之前=%s, 现在=%s)，"
+                        "[plugin_stop_task] PID %d 启动时间已变化 (之前=%s, 现在=%s)，"
                         "该 PID 已被其他进程复用，原进程已停止",
                         pid, expected_start_ticks, current_start,
                     )
@@ -251,20 +270,21 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
 
 def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -> Dict[str, Any]:
     """
-    插件应用停止服务任务（执行 bin/stop.sh 脚本）。
+    停止服务任务（执行运行区的 bin/stop.sh 脚本）。
 
     参数:
         - task_id:      任务ID（必填）
-        - service_name: 服务名称（必填），即 plugin 下的目录名
+        - service_name: 服务名称（必填），同时也是组件目录名
 
     流程:
-        1. 根据 service_name 定位 plugin 组件目录，读取 version
-        2. 找到 bin/stop.sh 脚本并执行
-        3. 校验 PID 进程是否已销毁 → 已销毁则删除 pid 文件并返回成功
+        1. 在运行区 {server.apps}/{service_name}/ 定位组件，从 state 读版本号
+        2. 从 state/config.yaml 的 pids 读取目标进程
+        3. 找到 bin/stop.sh 脚本并执行
+        4. 校验各 PID 是否已销毁 → 已销毁则清空状态（pids=[] / runtime=false）
+           并删除 state/pid
     """
     task_id = str(parameters.get("task_id", "") or "").strip()
     service_name = str(parameters.get("service_name", "") or "").strip()
-    sub_dir = str(parameters.get("sub_dir", "") or "plugin").strip()
 
     # ── 参数校验 ──
     if not task_id:
@@ -275,7 +295,7 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
                              error_type="ParameterMissing", error_message="service_name 缺失")
 
     # ── 路径解析 ──
-    error, component_dir, version, bin_dir = _resolve_paths(service_name, sub_dir)
+    error, component_dir, version, bin_dir = _resolve_paths(service_name)
     if error:
         error["task_id"] = task_id
         error["data"] = {
@@ -284,35 +304,25 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
         }
         return error
 
-    logging.info("[plugin_stop] plugin 组件目录: %s, 版本: %s, bin目录: %s", component_dir, version, bin_dir)
+    logging.info("[plugin_stop_task] 组件目录: %s, 版本: %s, bin目录: %s", component_dir, version, bin_dir)
 
     # ── 读取 PID（执行前）──
-    runtime_dir = os.path.join(component_dir, version, "runtime")
-    pid_file = os.path.join(runtime_dir, "pid")
+    # pid 来源：运行状态 state/config.yaml 的 pids 数组（支持多进程）
+    running_state = read_state(service_name, _SUB_DIR)
+    pid_list = read_state_pids(service_name, _SUB_DIR)
+    pid_file = get_pid_file(service_name, _SUB_DIR) or os.path.join(
+        component_dir, "state", "pid")
     pid_before = ""
     pid_start_ticks = None
-    pid_list = []  # 所有有效 PID
-    if os.path.isfile(pid_file):
-        try:
-            with open(pid_file, "r", encoding="utf-8") as pf:
-                content = pf.read().strip()
-            logging.info("[plugin_stop] 读取到 PID 文件内容: %s", content)
-            if content:
-                for line in content.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        pid_list.append(int(line))
-                    except ValueError:
-                        logging.warning("[plugin_stop] 忽略非法 PID 行: %s", line)
-            if pid_list:
-                pid_before = ",".join(str(p) for p in pid_list)
-                pid_start_ticks = _get_process_start_ticks(pid_list[0])
-                if pid_start_ticks is not None:
-                    logging.info("[plugin_stop] 目标进程启动时间戳: %s", pid_start_ticks)
-        except Exception as e:
-            logging.warning("[plugin_stop] 读取 PID 文件失败: %s", e)
+
+    if pid_list:
+        pid_before = ",".join(str(p) for p in pid_list)
+        pid_start_ticks = _get_process_start_ticks(pid_list[0])
+        logging.info("[plugin_stop_task] 读取到 pids=%s（来自 state 状态文件）", pid_list)
+        if pid_start_ticks is not None:
+            logging.info("[plugin_stop_task] 目标进程启动时间戳: %s", pid_start_ticks)
+    else:
+        logging.info("[plugin_stop_task] 状态文件中无 pid，可能服务未启动")
 
     # ── 定位 stop.sh 脚本 ──
     ext = ".bat" if os.name == "nt" else ".sh"
@@ -331,7 +341,6 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
         "component_dir": component_dir,
         "bin_dir": bin_dir,
         "script_path": script_path,
-        "runtime_dir": runtime_dir,
         "pid_file": pid_file,
         "pid_before": pid_before,
     }
@@ -340,7 +349,7 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
     exec_timeout = min(timeout, 60)
     exec_result = _execute_script(script_path, bin_dir, exec_timeout)
     logging.info(
-        "[plugin_stop] 脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+        "[plugin_stop_task] 脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
         exec_result["exit_code"], exec_result.get("stdout", ""), exec_result.get("stderr", ""),
     )
 
@@ -357,14 +366,24 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
             error_message=exec_result.get("stderr", "") or f"脚本退出码: {exec_result['exit_code']}",
         )
 
-    # ── 校验进程是否已销毁（多 PID 逐一检查）──
+    # ── 校验进程是否已销毁（多 PID 逐一检查，带等待重试）──
+    # 停止脚本多为 pkill/kill，被停止的进程（如 JVM）可能需要数秒优雅退出，
+    # 因此需轮询等待，不能执行完立即判定。
     if pid_list:
         still_alive = []
         for pid_int in pid_list:
-            try:
-                if _process_exists(pid_int, pid_start_ticks if pid_int == pid_list[0] else None):
-                    still_alive.append(str(pid_int))
-            except Exception:
+            exp_start = pid_start_ticks if pid_int == pid_list[0] else None
+            alive = True
+            for attempt in range(STOP_CONFIRM_RETRY):
+                try:
+                    if not _process_exists(pid_int, exp_start):
+                        alive = False
+                        break
+                except Exception:
+                    alive = False
+                    break
+                time.sleep(1)
+            if alive:
                 still_alive.append(str(pid_int))
         if still_alive:
             return _build_result(
@@ -378,26 +397,32 @@ def plugin_stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 
                 },
                 error_type="ProcessStillAlive",
                 error_message=f"PID {', '.join(still_alive)} 进程仍然存活",
-            )
-        logging.info("[plugin_stop] 所有进程 %s 已销毁", pid_before)
+                )
+        logging.info("[plugin_stop_task] 所有进程 %s 已销毁", pid_before)
     else:
-        logging.info("[plugin_stop] 未找到 PID 文件，可能服务未启动，跳过进程校验")
+        logging.info("[plugin_stop_task] 未找到 PID 文件，可能服务未启动，跳过进程校验")
 
-    # ── 删除 PID 文件 ──
-    if os.path.isfile(pid_file):
+    # ── 更新运行状态：清空 pids / processes，runtime 置 false ──
+    # （refresh_state_pids 内部以空列表调用即完成清空与置位）
+    refresh_state_pids(service_name, [], [], _SUB_DIR)
+
+    # ── 删除 pid 文件（state/pid）──
+    if pid_file and os.path.isfile(pid_file):
         try:
             os.remove(pid_file)
-            logging.info("[plugin_stop] PID 文件已删除: %s", pid_file)
+            logging.info("[plugin_stop_task] pid 文件已删除: %s", pid_file)
         except Exception as e:
-            logging.warning("[plugin_stop] 删除 PID 文件失败: %s", e)
+            logging.warning("[plugin_stop_task] 删除 pid 文件失败: %s", e)
 
     return _build_result(task_id, True, "进程已停止", data={
         **base_data,
         "status": "stopped",
+        "pids": pid_list,
         "pid": pid_before,
         "process_alive": False,
+        "runtime": False,
         "exit_code": exec_result["exit_code"],
-        "pid_file_deleted": not os.path.isfile(pid_file),
+        "pid_file_deleted": not (pid_file and os.path.isfile(pid_file)),
     })
 
 
@@ -413,13 +438,13 @@ if __name__ == "__main__":
 
     result = plugin_stop_task(
         {
-            "task_id": "test-xkt-stop-001",
-            "service_name": "test-service",
+            "task_id": "test-stop-001",
+            "service_name": "hellogitworld-master",
         },
     )
 
     print("\n" + "=" * 60)
-    print("  插件停止任务结果")
+    print("  停止任务结果")
     print("=" * 60)
     print(f"  task_id : {result.get('task_id', '')}")
     print(f"  成功    : {result['success']}")

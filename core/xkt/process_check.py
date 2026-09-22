@@ -1,8 +1,20 @@
 """
-显控台进程巡检模块
+显控台 / 插件 进程巡检模块
 
-遍历 download/displayConsole/ 目录，读取 {version}/runtime/config.yaml 中的进程名称，
-查找进程并将 PID 写入 {version}/runtime/pid 文件。
+【缓存区/运行区分离后的巡检规则】
+
+扫描「运行区」各服务的目录，读取 state/config.yaml 中的进程名（processes），
+查找真实在跑的进程并回写 PID 到运行状态。
+
+    1. 遍历 {server.apps}/[{sub_dir}/] 下所有服务目录
+    2. 读 state/config.yaml：
+         runtime != true            → 跳过（未运行）
+         无 processes 字段          → 跳过
+    3. 按进程名查找真实进程（用于处理升级/重启后 PID 变化）
+    4. 有存活进程 → 回写 pids/processes；无 → 清空并置 runtime=false
+
+原实现遍历 {download}/displayConsole/ 并读写 {version}/runtime/{config.yaml,pid}，
+依赖已废弃的 version 文件，故一并改造。
 """
 
 import logging
@@ -15,30 +27,40 @@ from typing import Any, Dict, List, Optional
 import psutil
 import yaml
 
-from utils.config_loader import load_config
+from utils.app_path import (
+    SUB_DIR_PLUGIN,
+    SUB_DIR_XKT,
+    find_apps_component_dir,
+    read_state,
+    write_state,
+    refresh_state_pids,
+    get_process_names,
+)
+from utils.config_loader import get_apps_dir, load_config
 
 
 # =============================================================================
 # 配置
 # =============================================================================
 
-# 显控台服务的根目录名：{download}/displayConsole/{服务名}/{版本}
-_XKT_SERVICE_ROOT = "displayConsole"
-
-# 插件服务的根目录名：{download}/plugin/{服务名}/{版本}
-_PLUGIN_SERVICE_ROOT = "plugin"
+# 显控台 / 插件 服务的类别子目录（运行区下）
+_XKT_SERVICE_ROOT = SUB_DIR_XKT
+_PLUGIN_SERVICE_ROOT = SUB_DIR_PLUGIN
 
 
-def _get_download_path() -> str:
-    """获取 download 目录路径"""
+def _get_apps_path() -> str:
+    """获取运行区（server.apps）目录路径"""
+    apps = get_apps_dir()
+    if apps:
+        return apps
     cfg = load_config()
-    download = cfg.get("server", {}).get("download", "download")
-    if not os.path.isabs(download):
-        download = os.path.join(
+    fallback = cfg.get("server", {}).get("apps", "apps")
+    if not os.path.isabs(fallback):
+        fallback = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            download
+            fallback
         )
-    return download
+    return fallback
 
 
 # =============================================================================
@@ -98,36 +120,31 @@ FILTER_BY_CWD = False
 
 def collect_service_pids(
     service_dir: str,
-    version_dir: str,
     process_names: Optional[List[str]] = None,
 ) -> List[int]:
     """
     查找服务当前"真实在跑"的进程 PID（升级/重启后即为新进程的 PID）。
 
     匹配规则:
-        1. 按 {version_dir}/runtime/config.yaml 的 name 字段找候选进程
+        1. 按传入的 process_names 找候选进程
+           （改造后由调用方从运行区 state/config.yaml 的 processes 字段读取，
+             不再读 {版本}/runtime/config.yaml）
         2. （可选）再按 cwd 过滤，只保留工作目录在该服务目录下的进程
-           —— 由 FILTER_BY_CWD 控制，默认关闭：进程可能运行在其他目录，
-              强过滤会把真实进程漏掉；需要防同名误伤时再打开。
+           —— 由 FILTER_BY_CWD 控制，默认关闭。
 
     参数:
-        service_dir:   服务目录，如 download/displayConsole/{服务名}（用于 cwd 过滤）
-        version_dir:   版本目录，如 {服务目录}/{版本}（用于读取 runtime/config.yaml）
-        process_names: 进程名列表，缺省时从 runtime/config.yaml 读取
+        service_dir:   运行区服务目录，如 {apps}/displayConsole/{服务名}（用于 cwd 过滤）
+        process_names: 进程名列表
 
     返回:
         存活的 PID 列表（已去重），查不到返回空列表
     """
-    if process_names is None:
-        runtime_config = _read_runtime_config(version_dir)
-        process_names = runtime_config.get("name", [])
-
     # 兼容 name 为单字符串的情况
     if isinstance(process_names, str):
         process_names = [process_names]
 
     if not process_names:
-        logging.debug("[xkt巡检] %s 未配置进程名，无法扫描进程", version_dir)
+        logging.debug("[xkt巡检] %s 未提供进程名，无法扫描进程", service_dir)
         return []
 
     service_name = os.path.basename(os.path.normpath(service_dir))
@@ -169,98 +186,35 @@ def collect_service_pids(
     return list(dict.fromkeys(all_pids))
 
 
-def _clear_pid_file(version_dir: str):
-    """
-    删除 {version_dir}/runtime/pid
-
-    服务已无存活进程时清理，避免陈旧 PID 被后续任务误读为"服务在运行"。
-    """
-    pid_file = os.path.join(version_dir, "runtime", "pid")
-    try:
-        if os.path.isfile(pid_file):
-            os.remove(pid_file)
-            logging.info("[xkt巡检] 已清理 PID 文件: %s", pid_file)
-    except Exception as e:
-        logging.warning("[xkt巡检] 清理 PID 文件失败: %s -> %s", pid_file, e)
-
-
-# =============================================================================
-# PID 文件写入（唯一落点：{version_dir}/runtime/pid）
-#
-# 说明：原先还额外维护一份 download/xkt/{service_name} 供资源监控读取，
-# 现已废弃 —— 显控台 PID 只写 {版本}/runtime/pid，资源监控也改为读该文件。
-# =============================================================================
-
-def _write_pid_file(version_dir: str, pid_list: List[int]):
-    """
-    在 {version_dir}/runtime/pid 文件中写入进程 PID
-
-    参数:
-        version_dir: 版本目录路径
-        pid_list: PID 列表
-    """
-    runtime_dir = os.path.join(version_dir, "runtime")
-    try:
-        Path(runtime_dir).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logging.error("[xkt巡检] 创建 runtime 目录失败: %s", e)
-        return
-
-    pid_file = os.path.join(runtime_dir, "pid")
-    content = "\n".join(str(pid) for pid in pid_list)
-
-    try:
-        with open(pid_file, "w", encoding="utf-8") as f:
-            f.write(content)
-        logging.info("[xkt巡检] 已写入 PID 文件: %s, PIDs=%s", pid_file, pid_list)
-    except Exception as e:
-        logging.error("[xkt巡检] 写入 PID 文件失败: %s -> %s", pid_file, e)
-
-
-# =============================================================================
-# 读取 runtime/config.yaml
-# =============================================================================
-
-def _read_runtime_config(version_dir: str) -> Dict[str, Any]:
-    """
-    读取 {version_dir}/runtime/config.yaml
-
-    返回:
-        解析后的配置字典，失败返回空 dict
-    """
-    config_path = os.path.join(version_dir, "runtime", "config.yaml")
-    if not os.path.isfile(config_path):
-        logging.warning("[xkt巡检] runtime/config.yaml 不存在: %s", config_path)
-        return {}
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        return config if isinstance(config, dict) else {}
-    except Exception as e:
-        logging.error("[xkt巡检] 读取 runtime/config.yaml 失败: %s -> %s", config_path, e)
-        return {}
+# 注：原 _clear_pid_file() / _write_pid_file() / _read_runtime_config() 已删除。
+#     它们维护 {版本}/runtime/{pid,config.yaml} 这套旧落点：
+#       · pid 现统一由运行状态 {apps}/[{sub_dir}/]{服务}/state/config.yaml 的 pids 数组承载
+#       • 进程名移到 state 的 processes 字段
+#       · 资源监控也改为读 state
+#     故三个函数均无调用方，一并移除。
 
 
 # =============================================================================
 # 巡检主逻辑
 # =============================================================================
 
-def check_service_group(root_dir: str, tag: str = "xkt巡检") -> List[Dict[str, Any]]:
+def check_service_group(root_dir: str, tag: str = "xkt巡检",
+                        sub_dir: str = "") -> List[Dict[str, Any]]:
     """
-    通用服务巡检：遍历 {root_dir}/{服务名}/ 目录，读取 runtime/config.yaml 中的进程名称，
-    查找进程并将 PID 写入 {version}/runtime/pid 文件。
+    通用服务巡检（**扫运行区**）：
 
     流程:
-        1. 遍历 {root_dir} 下所有子目录
-        2. 读取 version 文件获取版本号
-        3. 读取 {version}/runtime/config.yaml 获取 name 字段（进程名列表）
-        4. 按进程名查找进程
-        5. 存活则写入 {version}/runtime/pid，无存活进程则删除该文件
+        1. 遍历 {root_dir} 下所有服务子目录
+        2. 读 state/config.yaml：
+             runtime != true  → 跳过
+             无 processes     → 跳过
+        3. 按进程名查找真实在跑的进程（升级/重启后 PID 会变）
+        4. 有存活 → 回写 pids/processes；无 → 清空并置 runtime=false
 
     参数:
-        root_dir: 服务根目录，如 {download}/displayConsole 或 {download}/plugin
+        root_dir: 类别服务根目录，如 {apps}/displayConsole 或 {apps}/plugin
         tag:      日志前缀，便于区分显控台 / 插件
+        sub_dir:  类别子目录（用于回写状态；留空则从 root_dir 末尾推断）
 
     返回:
         巡检结果列表，每项包含 service_name、version、process_names、running、pids
@@ -273,55 +227,41 @@ def check_service_group(root_dir: str, tag: str = "xkt巡检") -> List[Dict[str,
 
     for entry in os.listdir(root_dir):
         service_dir = os.path.join(root_dir, entry)
-        if not os.path.isdir(service_dir):
+        # 跳过软链接（current/app/bin/config）与普通文件
+        if os.path.islink(service_dir) or not os.path.isdir(service_dir):
             continue
 
         service_name = entry
 
-        # ── 读取 version 文件 ──
-        version_file = os.path.join(service_dir, "version")
-        version = ""
-        if os.path.isfile(version_file):
-            try:
-                with open(version_file, "r", encoding="utf-8") as vf:
-                    version = vf.read().strip()
-            except Exception as e:
-                logging.warning("[%s] 读取 version 失败: %s -> %s", tag, version_file, e)
-
-        if not version:
-            logging.warning("[%s] 服务 %s 未找到 version 文件，跳过", tag, service_name)
+        # ── 读运行状态 ──
+        state = read_state(service_name, sub_dir)
+        if not state:
+            logging.debug("[%s] 服务 %s 无运行状态文件，跳过", tag, service_name)
             continue
 
-        # ── 定位版本目录并读取 runtime/config.yaml ──
-        version_dir = os.path.join(service_dir, version)
-        if not os.path.isdir(version_dir):
-            logging.warning("[%s] 版本目录不存在: %s，跳过", tag, version_dir)
+        if not state.get("runtime"):
+            logging.debug("[%s] 服务 %s 未运行，跳过", tag, service_name)
             continue
 
-        runtime_config = _read_runtime_config(version_dir)
-        if not runtime_config:
-            logging.warning("[%s] 服务 %s 无 runtime/config.yaml，跳过", tag, service_name)
-            continue
+        version = str(state.get("version", "") or "").strip()
 
-        # ── 读取进程名列表 ──
-        process_names = runtime_config.get("name", [])
+        # ── 读取进程名列表（来自 state 的 processes 字段）──
+        process_names = state.get("processes", [])
         if not process_names:
-            logging.warning("[%s] 服务 %s 的 config.yaml 中未配置 name 字段，跳过", tag, service_name)
+            logging.warning("[%s] 服务 %s 的状态中未记录进程名，跳过", tag, service_name)
             continue
-
-        # 兼容 name 为单字符串的情况
         if isinstance(process_names, str):
             process_names = [process_names]
 
         # ── 查找真实在跑的进程（升级/重启后即为新进程 PID）──
-        all_pids = collect_service_pids(service_dir, version_dir, process_names)
+        all_pids = collect_service_pids(service_dir, process_names)
 
-        # ── 同步 PID 记录（唯一落点：{version_dir}/runtime/pid）──
+        # ── 同步 PID 记录到运行状态 ──
         if all_pids:
-            _write_pid_file(version_dir, all_pids)
+            refresh_state_pids(service_name, all_pids, get_process_names(all_pids), sub_dir)
         else:
-            logging.info("[%s] 服务 %s 无存活进程, 清理 PID 记录", tag, service_name)
-            _clear_pid_file(version_dir)
+            logging.info("[%s] 服务 %s 无存活进程, 清空运行状态", tag, service_name)
+            refresh_state_pids(service_name, [], [], sub_dir)
 
         results.append({
             "service_name": service_name,
@@ -336,20 +276,22 @@ def check_service_group(root_dir: str, tag: str = "xkt巡检") -> List[Dict[str,
 
 def check_all_xkt_services() -> List[Dict[str, Any]]:
     """
-    显控台进程巡检：遍历 download/displayConsole/ 子目录。
+    显控台进程巡检：遍历运行区 {apps}/displayConsole/ 子目录。
     具体逻辑见 check_service_group()。
     """
-    download_path = _get_download_path()
-    return check_service_group(os.path.join(download_path, _XKT_SERVICE_ROOT), "xkt巡检")
+    apps_path = _get_apps_path()
+    return check_service_group(
+        os.path.join(apps_path, _XKT_SERVICE_ROOT), "xkt巡检", SUB_DIR_XKT)
 
 
 def check_all_plugin_services() -> List[Dict[str, Any]]:
     """
-    插件进程巡检：遍历 download/plugin/ 子目录。
-    具体逻辑见 check_service_group()。
+    插件进程巡检：遍历运行区 {apps}/plugin/ 子目录。
+    具体逻辑同 check_service_group()。
     """
-    download_path = _get_download_path()
-    return check_service_group(os.path.join(download_path, "plugin"), "plugin巡检")
+    apps_path = _get_apps_path()
+    return check_service_group(
+        os.path.join(apps_path, _PLUGIN_SERVICE_ROOT), "plugin巡检", SUB_DIR_PLUGIN)
 
 
 # =============================================================================
@@ -360,7 +302,7 @@ def xkt_check_loop(interval: int = 10):
     """
     显控台 / 插件进程巡检循环（用于后台线程）
 
-    每轮依次巡检两类服务，均按 runtime/config.yaml 声明的进程名
+    每轮依次巡检两类服务，均按运行状态 state/config.yaml 记录的进程名
     查找真实在跑进程，并把 PID 写入 {版本}/runtime/pid。
 
     参数:

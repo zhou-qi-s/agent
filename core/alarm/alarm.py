@@ -2,22 +2,19 @@
 进程资源告警模块
 
 功能：
-1. 遍历 download 目录，发现所有运行中的服务
-2. 从 Redis alarm:{ip}:{service_name} 读取告警阈值
-3. 查询进程 CPU / 内存 / IO 使用情况
-4. 判断是否超出阈值
-5. 上报告警到服务端
-6. 将采集数据写入 runtime/resources.txt
+1. 从 Redis 扫描 alarm:{ip}:* 规则，发现本机需要检测的服务
+2. 读运行区状态 {apps}/{service}/state/config.yaml 获取版本号与进程号
+3. 读取 {apps}/{service}/runtime/resources.txt 拿到各进程资源实际值
+4. 与 Redis 中的阈值比对，超出则上报告警
+5. 将采集数据写入 runtime/resources.txt
 
-目录结构：
-{download_base}/
+运行区目录结构：
+{apps}/
   my-service/
-    version          ← 版本号
-    app/
-      {version}/
-        runtime/
-          pid              ← 进程 PID
-          resources.txt    ← 采集数据 JSON
+    state/
+      config.yaml      ← 运行状态（pids / processes / name / runtime / version）
+    runtime/
+      resources.txt    ← 采集数据 JSON（由 process_info.py 写入）
 
 Redis 告警阈值键格式：
 Key:   alarm:{ip}:{service_name}
@@ -40,6 +37,11 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 
+from utils.app_path import (
+    read_state,
+    read_state_pids,
+    filter_alive_pids,
+)
 from utils.config_loader import load_config
 from utils.logger import logger
 from utils.redis_client import get_redis
@@ -61,6 +63,12 @@ from core.alarm.alarm_common import (
 # =========================================================
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
+
+# 扫描范围（产品约定，2026-09-20 用户确认）：
+#   资源告警**只覆盖虚拟机应用** —— 即运行区一楼的 {apps}/{服务名}。
+#   显控台（{apps}/displayConsole/）与插件（{apps}/plugin/）不纳入告警扫描，
+#   所以这里刻意不做类别层探测，找不到就按"不在扫描范围"跳过。
 
 
 # =========================================================
@@ -124,7 +132,7 @@ def _get_cpu_subsequent(pid: int, process: psutil.Process) -> float:
     if delta_time <= 0:
         return 0.0
 
-    cpu_percent = ((delta_user + delta_system) / delta_time) * 100.0 / psutil.cpu_count()
+    cpu_percent = ((delta_user + delta_system) / delta_time) * 100.0
     return round(cpu_percent, 2)
 
 
@@ -290,59 +298,65 @@ def read_alarm_from_redis(ip: str, service_name: str) -> Dict[str, Any]:
         return {}
 
 
-def read_version(service_dir: str) -> str:
-    """读取服务目录下的 version 文件"""
-    version_file = os.path.join(service_dir, "version")
-    if not os.path.isfile(version_file):
-        return ""
-    try:
-        with open(version_file, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+def read_version(service_name: str) -> str:
+    """
+    读取服务当前版本号。
+
+    改造后版本号来源：运行区 {apps}/{service_name}/state/config.yaml 的 version 字段
+    （下载阶段已不再生成 {service}/version 文件）
+
+    注意：告警只扫虚拟机应用，故不涉及类别层（displayConsole/plugin）。
+    """
+    state = read_state(service_name)
+    return str(state.get("version", "") or "").strip()
 
 
-def read_pid(runtime_dir: str) -> Optional[int]:
-    """读取 runtime 目录下的 pid 文件，支持多行，返回第一个有效 PID"""
-    pid_file = os.path.join(runtime_dir, "pid")
-    if not os.path.isfile(pid_file):
-        return None
-    try:
-        with open(pid_file, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content:
-            return None
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                return int(line)
-            except ValueError:
-                continue
-        return None
-    except Exception:
-        return None
+def read_pids(service_name: str) -> List[int]:
+    """
+    读取服务的进程号列表。
+
+    改造后 pid 来源：运行区 {apps}/{service_name}/state/config.yaml 的 pids 字段
+    （原为 {service}/{version}/runtime/pid 文件）
+
+    返回全部存活 pid（多进程服务需全部纳入告警检测）。
+    """
+    pids = read_state_pids(service_name)
+    return filter_alive_pids(pids, service_name)
+
+
+def read_pid(service_name: str) -> Optional[int]:
+    """
+    读取服务的首个进程号（兼容旧调用方）。
+
+    多进程场景请使用 read_pids() 获取全部。
+    """
+    pids = read_pids(service_name)
+    return pids[0] if pids else None
 
 
 def discover_running_services() -> List[Dict]:
     """
     从 Redis 扫描所有 alarm:{ip}:* 的 key, 以此为驱动发现运行中的服务。
 
+    改造后运行态信息来自运行区：
+        {apps}/{service_name}/state/config.yaml
+        {apps}/{service_name}/runtime/resources.txt
+
     Returns:
         [
             {
                 "service_name": "my-service",
-                "pid": 12345,
-                "runtime_dir": "/data/download/my-service/app/1.0.0/runtime",
+                "version": "1.0.0",
+                "pids": [12345, 12346],
+                "runtime_dir": "/var/cache/agent/apps/my-service/runtime",
                 "cpu_threshold": 90,
                 "memory_threshold_mb": 1024.0,
                 "io_threshold": 500,
             }
         ]
     """
-    if not _DOWNLOAD_BASE or not os.path.isdir(_DOWNLOAD_BASE):
-        logger.warning("[ALARM] _DOWNLOAD_BASE 不存在或不是目录: %s", _DOWNLOAD_BASE)
+    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
+        logger.warning("[ALARM] 运行区目录不存在: %s", _APPS_BASE)
         return []
 
     result: List[Dict] = []
@@ -363,7 +377,7 @@ def discover_running_services() -> List[Dict]:
         return []
 
     # ---- 第2步：逐个 key 提取 service_name, 匹配本地服务 ----
-    logger.info("[ALARM-SCAN] 开始逐个匹配服务, _DOWNLOAD_BASE=%s", _DOWNLOAD_BASE)
+    logger.info("[ALARM-SCAN] 开始逐个匹配服务, _APPS_BASE=%s", _APPS_BASE)
     for key in alarm_keys:
         key_str = key if isinstance(key, str) else key.decode("utf-8")
         # 从 alarm:192.168.0.4:RuoYi-springboot2 提取 service_name
@@ -374,16 +388,24 @@ def discover_running_services() -> List[Dict]:
         service_name = key_str[len(prefix):]
         logger.info("[ALARM-SCAN] 匹配到 service_name=%s", service_name)
 
-        # 检查服务目录
-        service_dir = os.path.join(_DOWNLOAD_BASE, service_name)
+        # 检查运行区服务目录（只看一楼：资源告警只覆盖虚拟机应用）
+        service_dir = os.path.join(_APPS_BASE, service_name)
         if not os.path.isdir(service_dir):
-            logger.warning("[ALARM-SCAN] 服务目录不存在: %s, 跳过", service_dir)
+            logger.info("[ALARM-SCAN] 不在扫描范围（非虚拟机应用）或未安装，跳过: %s", service_dir)
             continue
 
-        # 必须有 version 文件
-        version = read_version(service_dir)
+        # 从运行状态文件取版本号与进程
+        state = read_state(service_name)
+        if not state:
+            logger.warning("[ALARM] 状态文件缺失，跳过: %s", service_name)
+            continue
+        if not state.get("runtime"):
+            logger.info("[ALARM] 服务未运行，跳过: %s", service_name)
+            continue
+
+        version = read_version(service_name)
         if not version:
-            logger.warning("[ALARM] version 文件缺失，跳过: %s", service_name)
+            logger.warning("[ALARM] 状态文件中版本号缺失，跳过: %s", service_name)
             continue
 
         # 从 Redis 读告警规则
@@ -397,15 +419,16 @@ def discover_running_services() -> List[Dict]:
             logger.warning("[ALARM] Redis 告警阈值不完整，跳过: %s (cpu=%s mem=%s io=%s)", service_name, cpu_threshold, memory_threshold, io_threshold)
             continue
 
-        # 进入 {version}/runtime/
-        runtime_dir = os.path.join(service_dir, version, "runtime")
+        # 运行区 runtime 目录（resources.txt 落点）
+        runtime_dir = os.path.join(service_dir, "runtime")
         if not os.path.isdir(runtime_dir):
             logger.warning("[ALARM] runtime 目录不存在: %s, 跳过", runtime_dir)
             continue
 
-        pid = read_pid(runtime_dir)
-        if pid is None:
-            logger.warning("[ALARM] PID 文件缺失，跳过: %s/%s", service_name, version)
+        # 从状态文件读取 pids（多进程服务全部纳入）
+        pids = read_pids(service_name)
+        if not pids:
+            logger.warning("[ALARM] 状态文件中无存活进程，跳过: %s", service_name)
             continue
 
         # 确保阈值为数值类型（Redis 返回的 JSON 值为字符串）
@@ -419,7 +442,9 @@ def discover_running_services() -> List[Dict]:
 
         result.append({
             "service_name": service_name,
-            "pid": pid,
+            "version": version,
+            "pids": pids,
+            "pid": pids[0],          # 兼容旧调用方
             "runtime_dir": runtime_dir,
             "cpu_threshold": cpu_threshold,
             "memory_threshold_mb": memory_threshold,
@@ -526,7 +551,10 @@ def check_and_report_alarms() -> List[Dict]:
 
     for svc in services:
         service_name = svc["service_name"]
-        pid = svc["pid"]
+        pids = svc.get("pids") or [svc.get("pid")]
+        # 冷却 key 与告警展示用首个 pid（多进程服务合并为一条告警）
+        pid = pids[0] if pids else None
+        pid_text = ",".join(str(p) for p in pids) if pids else "-"
         runtime_dir = svc["runtime_dir"]
         cpu_threshold = svc["cpu_threshold"]
         memory_threshold_mb = svc["memory_threshold_mb"]
@@ -537,13 +565,13 @@ def check_and_report_alarms() -> List[Dict]:
 
         if resources is None:
             # resources.txt 不存在或无数据
-            logger.warning("[ALARM-CHECK] 服务=%s PID=%s, resources.txt 无数据, 尝试上报进程异常", service_name, pid)
+            logger.warning("[ALARM-CHECK] 服务=%s PID=%s, resources.txt 无数据, 尝试上报进程异常", service_name, pid_text)
             if can_report_alarm(pid, ALARM_TYPE_PROCESS_NOT_FOUND):
                 report_alarm(
                     alarm_type=ALARM_TYPE_PROCESS_NOT_FOUND,
                     service_name=service_name,
                     alarm_name=f"{service_name} 进程异常",
-                    content=f"服务 {service_name}(PID:{pid}) 进程可能未启动，resources.txt 无数据",
+                    content=f"服务 {service_name}(PID:{pid_text}) 进程可能未启动，resources.txt 无数据",
                 )
                 reported.append({
                     "type": "process_not_found",
@@ -559,7 +587,7 @@ def check_and_report_alarms() -> List[Dict]:
         mem_val = resources["mem"]
         io_val = resources["io"]
         logger.info("[ALARM-CHECK] 服务=%s PID=%s 实际值: cpu=%.1f mem=%.1f io=%.1f | 阈值: cpu=%.1f mem=%.1f io=%.1f",
-                    service_name, pid, cpu_val, mem_val, io_val,
+                    service_name, pid_text, cpu_val, mem_val, io_val,
                     cpu_threshold, memory_threshold_mb, io_threshold)
 
         # ---- CPU 告警 ----
@@ -570,7 +598,7 @@ def check_and_report_alarms() -> List[Dict]:
                     alarm_type=ALARM_TYPE_CPU,
                     service_name=service_name,
                     alarm_name=f"{service_name} CPU告警",
-                    content=f"服务 {service_name}(PID:{pid}) CPU 使用 {cpu_val}%，超过阈值 {cpu_threshold}%",
+                    content=f"服务 {service_name}(PID:{pid_text}) CPU 使用 {cpu_val}%，超过阈值 {cpu_threshold}%",
                 )
                 reported.append({
                     "type": "cpu",
@@ -590,7 +618,7 @@ def check_and_report_alarms() -> List[Dict]:
                     alarm_type=ALARM_TYPE_MEMORY,
                     service_name=service_name,
                     alarm_name=f"{service_name} 内存告警",
-                    content=f"服务 {service_name}(PID:{pid}) 内存使用 {mem_val}MB，超过阈值 {memory_threshold_mb}MB",
+                    content=f"服务 {service_name}(PID:{pid_text}) 内存使用 {mem_val}MB，超过阈值 {memory_threshold_mb}MB",
                 )
                 reported.append({
                     "type": "memory",
@@ -610,7 +638,7 @@ def check_and_report_alarms() -> List[Dict]:
                     alarm_type=ALARM_TYPE_IO,
                     service_name=service_name,
                     alarm_name=f"{service_name} IO告警",
-                    content=f"服务 {service_name}(PID:{pid}) IO 使用 {io_val}MB，超过阈值 {io_threshold}MB",
+                    content=f"服务 {service_name}(PID:{pid_text}) IO 使用 {io_val}MB，超过阈值 {io_threshold}MB",
                 )
                 reported.append({
                     "type": "io",

@@ -1,5 +1,11 @@
 """
 告警相关的 API 路由
+
+【改造说明】
+服务的 resources.txt 已改由 process_info.py 写入「运行区」：
+    {apps}/{service_name}/runtime/resources.txt
+（原为 {download}/{service_name}/app/{version}/runtime/resources.txt，
+  依赖已废弃的 version 文件）
 """
 import json
 import logging
@@ -10,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from core.alarm.alarm_common import get_local_ip
+from utils.app_path import resolve_sub_dir
 from utils.config_loader import load_config
 from utils.redis_client import get_redis
 
@@ -17,6 +24,7 @@ router = APIRouter()
 
 _CONFIG = load_config()
 _DOWNLOAD_BASE = _CONFIG.get("server", {}).get("download", "")
+_APPS_BASE = _CONFIG.get("server", {}).get("apps", "")
 
 # 合法的阈值字段: cpu(%), memory(kb), io(bk)
 _THRESHOLD_KEYS = {"cpu", "memory", "io"}
@@ -325,31 +333,23 @@ async def get_resources(service_name: str = Query(..., description="服务名称
     """
     根据服务名返回 runtime/resources.txt 的内容。
 
-    查找路径: {download}/{service_name}/app/{version}/runtime/resources.txt
+    改造后查找路径（运行区）:
+        {apps}/{service_name}/runtime/resources.txt
+
+    原路径 {download}/{service_name}/app/{version}/runtime/resources.txt 已废弃：
+    版本号不再来自 version 文件，resources.txt 也改由 process_info.py 写入运行区。
     """
-    if not _DOWNLOAD_BASE:
-        raise HTTPException(status_code=500, detail="download 目录未配置")
+    if not _APPS_BASE:
+        raise HTTPException(status_code=500, detail="server.apps 运行区目录未配置")
 
-    service_dir = os.path.join(_DOWNLOAD_BASE, service_name)
+    # 显控台/插件服务在运行区多一层（displayConsole/plugin），先探测所在层
+    sub_dir = resolve_sub_dir(service_name, roots=[_APPS_BASE])
+    service_dir = os.path.join(_APPS_BASE, sub_dir, service_name) if sub_dir \
+        else os.path.join(_APPS_BASE, service_name)
     if not os.path.isdir(service_dir):
-        raise HTTPException(status_code=404, detail=f"服务目录不存在: {service_dir}")
+        raise HTTPException(status_code=404, detail=f"运行区服务目录不存在: {service_dir}")
 
-    # 读取 version 文件
-    version_file = os.path.join(service_dir, "version")
-    if not os.path.isfile(version_file):
-        raise HTTPException(status_code=404, detail=f"version 文件不存在: {version_file}")
-
-    try:
-        with open(version_file, "r", encoding="utf-8") as f:
-            version = f.read().strip()
-    except Exception:
-        raise HTTPException(status_code=500, detail="读取 version 文件失败")
-
-    if not version:
-        raise HTTPException(status_code=404, detail="version 内容为空")
-
-    # 定位 resources.txt
-    resources_file = os.path.join(service_dir, "app", version, "runtime", "resources.txt")
+    resources_file = os.path.join(service_dir, "runtime", "resources.txt")
     if not os.path.isfile(resources_file):
         raise HTTPException(status_code=404, detail=f"resources.txt 不存在: {resources_file}")
 

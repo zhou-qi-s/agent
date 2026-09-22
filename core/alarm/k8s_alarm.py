@@ -147,7 +147,7 @@ def get_pod_top(pod_name: str, namespace: str) -> Optional[Dict[str, float]]:
     等价命令: kubectl top pod {pod_name} -n {ns} --no-headers
 
     Returns:
-        {"cpu_millicores": 150.0, "memory_mb": 512.0}  或  None
+        {"cpu_millicores": 150.0, "memory_mib": 512.0}  或  None
     """
     success, output = _run_kubectl([
         "top", "pod", pod_name,
@@ -165,7 +165,7 @@ def get_pod_top(pod_name: str, namespace: str) -> Optional[Dict[str, float]]:
 
     return {
         "cpu_millicores": _parse_cpu(parts[1]),
-        "memory_mb": _parse_memory(parts[2]),
+        "memory_mib": _parse_memory(parts[2]),
     }
 
 
@@ -337,7 +337,7 @@ def check_and_report_k8s_alarms() -> List[Dict[str, Any]]:
                 continue
 
             cpu_val = top_data["cpu_millicores"]
-            mem_val = top_data["memory_mb"]
+            mem_val = top_data["memory_mib"]
             alarm_label = f"{namespace}/{labels}/{pod_name}"
 
             # ---- CPU 告警（百分比 = 使用量 / limit * 100） ----
@@ -376,8 +376,8 @@ def check_and_report_k8s_alarms() -> List[Dict[str, Any]]:
                         service_name=alarm_label,
                         alarm_name=f"{namespace}/{pod_name} 内存告警",
                         content=(
-                            f"容器 {namespace}/{pod_name} 内存使用 {mem_val:.1f}MB，"
-                            f"超过阈值 {memory_threshold:.1f}MB"
+                            f"容器 {namespace}/{pod_name} 内存使用 {mem_val:.1f}MiB，"
+                            f"超过阈值 {memory_threshold:.1f}MiB"
                         ),
                     )
                     reported.append({
