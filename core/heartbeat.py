@@ -22,6 +22,23 @@ VERSION = CONFIG.get('version', '1.0.0')
 agent = "agent:info:"
 
 
+def _latest_host_info():
+    """
+    取最新宿主资源：
+    优先复用独立采集器 core/host_resource.py 的缓存（它每 10 秒采一次、启动即采，并写独立的
+    Redis 键 agent:metrics:{agent_id}），这样心跳负载里的 host_info 不必自己再重复采一遍；
+    采集器还没起来（或导入失败）时才回退到自己采一次。
+    """
+    try:
+        from core.host_resource import get_cached_host_info
+        cached = get_cached_host_info()
+        if cached:
+            return cached
+    except Exception:
+        pass
+    return get_host_info()
+
+
 # ================== 心跳线程函数 ==================
 def heartbeat_loop(agent_id):
     logger.info("心跳线程启动成功")
@@ -45,7 +62,9 @@ def heartbeat_loop(agent_id):
             if redisUtils.exists(key):
                 data = redisUtils.get(key)
                 if timer == 0:
-                    data["host_info"] = get_host_info()
+                    # 资源数据的"真身"由独立采集器 core/host_resource.py 每 10 秒写 agent:metrics:{agent_id}；
+                    # 这里只复用它的缓存，保持心跳负载里仍有 host_info（兼容旧消费方）
+                    data["host_info"] = _latest_host_info()
                     old_ip = ip
                     try:
                         ip = get_local_ip()
@@ -100,9 +119,11 @@ def get_gpu_info():
     if intel_gpus is not None:
         gpu_list.extend(intel_gpus)
 
-    # 如果三种方式都没有检测到，返回未检测到信息
+    # 三种方式都没检测到 = 这台机器就是没有 GPU：直接返回空列表。
+    # 原来返回占位项 [{'status':'not_detected',...}]，消费方按"数组长度"渲染时会凭空多出
+    # 一张「GPU 运算卡 (1)」卡片（名称空白、undefined°C、NaN 进度条），故改成返回空。
     if not gpu_list:
-        return [{'status': 'not_detected', 'message': '未检测到 GPU 或无法获取 GPU 信息'}]
+        return []
 
     return gpu_list
 

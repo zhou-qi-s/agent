@@ -150,6 +150,77 @@ def write_promtail_config():
         return False
 
 
+def _find_running_promtail_pids():
+    """
+    扫描 /proc，找出「用本 Agent 的二进制/配置启动」的 promtail 进程 PID。
+
+    为什么要自己扫 /proc：
+        Agent 用 start_new_session=True 启动 promtail（独立会话/进程组），
+        Agent 自身被重启（升级包、重新纳管）后旧 promtail 不会被带走 ——
+        它会继续用同一份配置【重复推送同一批日志】，还会占着 9081 端口，
+        导致新起的 promtail 绑不上端口而直接退出。
+
+    只认 _PROMTAIL_CONFIG / _PROMTAIL_PATH，避免误杀平台「应用日志」功能部署的 promtail
+    （那个用的是 {脚本目录}/{业务名}/promtail/ 下的二进制与 yaml）。
+    """
+    pids = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == os.getpid():
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                raw = f.read()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        parts = [p for p in raw.decode("utf-8", "replace").split("\0") if p]
+        if not parts:
+            continue
+        # 只看 promtail 进程本身
+        if "promtail" not in os.path.basename(parts[0]):
+            continue
+        if _PROMTAIL_CONFIG in " ".join(parts) or parts[0] == _PROMTAIL_PATH:
+            pids.append(pid)
+    return pids
+
+
+def cleanup_stale_promtail():
+    """
+    清理残留的旧 promtail 进程（返回清理个数）。
+
+    场景：重新纳管 / Agent 升级后，上一代 Agent 拉起的 promtail 既不会被带走、
+    也不会被 _promtail_proc 引用到 —— 不清理就会越积越多（同一份日志被重复推送多次，
+    且新进程可能因 9081 端口被占而起不来）。
+    """
+    global _promtail_proc
+    try:
+        pids = _find_running_promtail_pids()
+    except Exception as e:
+        logger.warning("扫描残留 promtail 失败: %s", e)
+        return 0
+
+    # 当前 Agent 自己拉起、且还活着的那一个不算残留
+    mine = _promtail_proc.pid if (_promtail_proc and _promtail_proc.poll() is None) else None
+    killed = 0
+    for pid in pids:
+        if pid == mine:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logger.info("清理残留 promtail 进程 PID=%s（旧实例，重复推送源）", pid)
+            killed += 1
+        except Exception as e:
+            logger.warning("清理 promtail PID=%s 失败: %s", pid, e)
+    if killed:
+        # 等端口(9081)与 positions 文件句柄释放，否则新进程可能绑定失败直接退出
+        time.sleep(2)
+    return killed
+
+
 def start_promtail():
     """
     启动 promtail 进程（如果已运行则跳过）
@@ -168,6 +239,10 @@ def start_promtail():
     if _promtail_proc and _promtail_proc.poll() is None:
         logger.info("promtail 已在运行，跳过启动")
         return True
+
+    # ⚠️ 启动前先清理上一次 Agent 运行留下的 promtail：
+    #    Agent 重启不会带走独立会话里的子进程，不清理会重复推送同一批日志、并占用 9081 端口
+    cleanup_stale_promtail()
 
     # 生成配置文件
     if not write_promtail_config():
@@ -200,6 +275,8 @@ def stop_promtail():
         except Exception as e:
             logger.warning("停止 promtail 异常: %s", e)
     _promtail_proc = None
+    # 顺带清掉上一次 Agent 运行留下的 promtail —— 否则「取消纳管」后它仍会继续往 Loki 推日志
+    cleanup_stale_promtail()
 
 
 def promtail_loop(interval: int = 30):

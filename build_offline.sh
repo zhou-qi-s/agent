@@ -319,6 +319,35 @@ for p in $(agent_pids); do
     fi
 done
 
+# 4.5 停止 promtail 日志采集进程
+#     Agent 用 start_new_session=True 拉起 promtail（独立会话/进程组），不会随 Agent 一起退出；
+#     不清理的话「取消纳管」后它仍会继续往 Loki 推日志（且占着 9081 端口）。
+#     只杀用本 Agent 配置(/var/cache/agent/promtail*.yaml)起的 promtail，
+#     避免误杀平台「应用日志」功能部署到 {脚本目录}/{业务名}/promtail/ 的那一个。
+promtail_pids() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f 'promtail.*/var/cache/agent/promtail' 2>/dev/null || true
+    else
+        ps -eo pid,args 2>/dev/null | awk '/[p]romtail.*\/var\/cache\/agent\/promtail/ {print $1}' || true
+    fi
+}
+for p in $(promtail_pids); do
+    if [[ "$p" != "$$" ]]; then
+        kill "$p" 2>/dev/null || true
+    fi
+done
+sleep 1
+for p in $(promtail_pids); do
+    if [[ "$p" != "$$" ]]; then
+        kill -9 "$p" 2>/dev/null || true
+    fi
+done
+if [[ -z "$(promtail_pids)" ]]; then
+    echo "promtail 已停止"
+else
+    echo "警告：仍有 promtail 残留" >&2
+fi
+
 # 5. 只有确认没有残留才清除停止标志；否则保留标志，防止 Agent 被重新拉起
 if [[ -n "$(guard_pids)$(agent_pids)" ]]; then
     echo "警告：仍有 Agent/守护进程残留，保留 $STOP_FLAG 以防被拉起，请手工检查" >&2

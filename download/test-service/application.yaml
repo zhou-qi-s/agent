@@ -1,0 +1,5 @@
+file_path: /opt/app/bin
+process_name: java
+service_name: test-service
+suffix: tar.gz
+version: 1.0.0

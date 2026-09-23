@@ -23,7 +23,7 @@ jobs:
 
       - name: Show runner info
         run: |
-          uname -m
+          uname -a
           python3 --version
           gcc --version | head -1
 
@@ -31,24 +31,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
-          python3 -m pip install -U pip
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install -U nuitka ordered-set zstandard httptools anyio h11
 
-      - name: Build with Nuitka (build_offline.sh)
+      - name: Build with Nuitka
         run: |
-          chmod +x build_offline.sh
-          PYTHON_BIN=python3 ./build_offline.sh 2>&1 | tail -80
+          chmod +x nuitka_linux_build.sh
+          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
 
       - name: Verify output
         run: |
           ls -la linux_release/
-          echo "--- package contents (scripts + core) ---"
-          tar -tzf linux_release/agent-linux.tar.gz | grep -E '\.sh$|core/|main.bin'
-          echo "--- main.bin arch ---"
-          file linux_release_tmp 2>/dev/null || true
-          mkdir -p /tmp/chk && tar -xzf linux_release/agent-linux.tar.gz -C /tmp/chk main.dist/main.bin
-          file /tmp/chk/main.dist/main.bin
+          tar -tzf linux_release/agent-linux.tar.gz | head -20
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -66,7 +58,7 @@ jobs:
 
       - name: Show runner info
         run: |
-          uname -m
+          uname -a
           python3 --version
           gcc --version | head -1
 
@@ -74,23 +66,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
-          python3 -m pip install -U pip
-          python3 -m pip install -r requirements.txt
-          python3 -m pip install -U nuitka ordered-set zstandard httptools anyio h11
 
-      - name: Build with Nuitka (build_offline.sh)
+      - name: Build with Nuitka
         run: |
-          chmod +x build_offline.sh
-          PYTHON_BIN=python3 ./build_offline.sh 2>&1 | tail -80
+          chmod +x nuitka_linux_build.sh
+          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
 
       - name: Verify output
         run: |
           ls -la linux_release/
-          echo "--- package contents (scripts + core) ---"
-          tar -tzf linux_release/agent-linux.tar.gz | grep -E '\.sh$|core/|main.bin'
-          echo "--- main.bin arch ---"
-          mkdir -p /tmp/chk && tar -xzf linux_release/agent-linux.tar.gz -C /tmp/chk main.dist/main.bin
-          file /tmp/chk/main.dist/main.bin
+          tar -tzf linux_release/agent-linux.tar.gz | head -20
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

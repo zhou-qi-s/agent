@@ -14,6 +14,7 @@ import time
 import traceback
 
 from core.heartbeat import heartbeat_loop
+from core.host_resource import host_resource_loop
 from core.helm import init_kubeconfig, sync_helm_list
 from core.register import register_agent
 from core.task_utils import task_loop
@@ -140,6 +141,15 @@ def main():
         logger.info("启动心跳线程...")
         hb_thread = threading.Thread(target=heartbeat_loop, kwargs={"agent_id": agent_id}, daemon=True)
         hb_thread.start()
+
+        # ========== 宿主资源采集线程（独立采集，写 Redis agent:metrics:{agent_id}） ==========
+        # 与"进程采集"同一套路：采集器独立跑、独立键、独立 TTL；
+        # 不再把资源数据塞进心跳（心跳只在 timer==0 时采、首次注册还不带，会让抽屉前 15 秒下半截空白）
+        logger.info("启动宿主资源采集线程...")
+        host_resource_thread = threading.Thread(
+            target=host_resource_loop, kwargs={"agent_id": agent_id}, name="HostResource", daemon=True
+        )
+        host_resource_thread.start()
 
         # ========== 读取任务开关类型（仅支持复合类型） ==========
         _types_raw = (_cfg.get("server", {}) or {}).get("type", "") or ""
