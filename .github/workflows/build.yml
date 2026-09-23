@@ -34,8 +34,12 @@ jobs:
 
       - name: Build with Nuitka
         run: |
-          chmod +x nuitka_linux_build.sh
-          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
+          # ★ 必须用 build_offline.sh（完整离线打包流水线）：
+          #   它生成的 stop_agent.sh 含「第 4.5 段 —— 停止时一并清 promtail」。
+          #   ✗ 不要换成 nuitka_linux_build.sh：那个脚本生成的 stop_agent.sh 没有该段，
+          #     会导致「取消纳管后节点上的 promtail 仍在继续往 Loki 推日志」。
+          chmod +x build_offline.sh
+          PYTHON_BIN=python3 ./build_offline.sh 2>&1 | tail -60
 
       - name: Verify output
         run: |
@@ -69,8 +73,12 @@ jobs:
 
       - name: Build with Nuitka
         run: |
-          chmod +x nuitka_linux_build.sh
-          PYTHON_BIN=python3 ./nuitka_linux_build.sh 2>&1 | tail -60
+          # ★ 必须用 build_offline.sh（完整离线打包流水线）：
+          #   它生成的 stop_agent.sh 含「第 4.5 段 —— 停止时一并清 promtail」。
+          #   ✗ 不要换成 nuitka_linux_build.sh：那个脚本生成的 stop_agent.sh 没有该段，
+          #     会导致「取消纳管后节点上的 promtail 仍在继续往 Loki 推日志」。
+          chmod +x build_offline.sh
+          PYTHON_BIN=python3 ./build_offline.sh 2>&1 | tail -60
 
       - name: Verify output
         run: |
