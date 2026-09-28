@@ -403,7 +403,7 @@ def plugin_upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int
 
     # ── Step 2: 校验「缓存区已下载的版本」（不下载）──
     # 升级入口（平台侧）只允许选节点缓存区里已下载的版本，所以这里只校验目录存在：
-    # 存在 → 继续（Step 3 停旧版 → Step 4 安装）；不存在 → 直接报错，不再自动下载。
+    # 存在 → 继续（Step 3 停旧版 → Step 3.5 卸载旧版 → Step 4 安装新版）；不存在 → 直接报错，不再自动下载。
     # ★ 必须放在「停止旧版本」之前：校验失败时旧服务还没被动过，
     #   不会出现"把旧版本停了、才发现新版本没下载"导致服务停在那儿起不来的情况。
     cache_version_dir = find_cache_version_dir(service_name, new_version, _SUB_DIR)
@@ -511,15 +511,66 @@ def plugin_upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int
             "message": "无旧版本，跳过停止",
         })
 
+    # ── Step 3.5: 执行旧版本的「卸载脚本」（升级 = 先卸载，再安装）──
+    # 此时运行区 bin 软链接仍指向旧版本（current/bin），所以这里跑到的就是旧包的 bin/uninstall.sh。
+    # 脚本不存在 → 记一步"跳过"并告警（不阻断升级，老包可能没有这个脚本）；
+    # 脚本存在但执行失败 → 升级中止（避免在没卸干净的基础上再装一遍）。
+    uninstall_script = os.path.join(
+        component_dir, "bin", "uninstall.bat" if os.name == "nt" else "uninstall.sh")
+    if os.path.isfile(uninstall_script):
+        logging.info("[plugin_upgrade_task] 执行卸载脚本: %s", uninstall_script)
+        uninstall_exec = _execute_script(
+            uninstall_script, os.path.dirname(uninstall_script), min(timeout, 120))
+        logging.info(
+            "[plugin_upgrade_task] 卸载脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
+            uninstall_exec["exit_code"], uninstall_exec.get("stdout", ""), uninstall_exec.get("stderr", ""),
+        )
+        steps.append({
+            "step": "uninstall_old",
+            "success": uninstall_exec["success"],
+            "message": "执行旧版本卸载脚本" + ("成功" if uninstall_exec["success"]
+                                        else f"失败 (exit_code={uninstall_exec['exit_code']})"),
+            "data": {"script": uninstall_script,
+                     "exit_code": uninstall_exec["exit_code"],
+                     "stdout": uninstall_exec.get("stdout", ""),
+                     "stderr": uninstall_exec.get("stderr", "")},
+        })
+        if not uninstall_exec["success"]:
+            return _build_result(
+                task_id, False,
+                f"旧版本卸载脚本执行失败 (exit_code={uninstall_exec['exit_code']})，升级中止",
+                data={"service_name": service_name,
+                      "current_version": current_version,
+                      "new_version": new_version,
+                      "steps": steps},
+                error_type="UninstallScriptError",
+                error_message=(uninstall_exec.get("stderr", "")
+                               or f"卸载脚本返回非零退出码: {uninstall_exec['exit_code']}"),
+            )
+    else:
+        logging.warning("[plugin_upgrade_task] 未找到卸载脚本，跳过卸载步骤: %s", uninstall_script)
+        steps.append({
+            "step": "uninstall_old",
+            "success": True,
+            "message": f"未找到卸载脚本（{uninstall_script}），跳过卸载步骤",
+        })
+
     # ── Step 4: 安装新版本 ──
-    # install 会重建 current 软链接指向新版本（app/bin/config 保持共存共用）
+    # install 会重建 current 软链接指向新版本（app/bin/config 保持共存共用），并执行新包的 bin/install.sh
     logging.info("[plugin_upgrade_task] 开始安装新版本")
-    install_result = plugin_install_task({
+    # 队列配置文件参数（平台在「安装」时下发，存在实例的 INSTALL_PATH 上，升级时同样带下来）：
+    # 原样透传给 plugin_install_task，升级后同样会把 queue.properties 写进用户当初填的那个文件夹。
+    _install_params: Dict[str, Any] = {
         "task_id": task_id,
         "file_name": service_name,
         "version": new_version,
         "sub_dir": _SUB_DIR,
-    }, retry=retry, timeout=timeout)
+    }
+    for _key in ("install_dir", "queue_file_name", "queue_file_content"):
+        _val = parameters.get(_key)
+        if _val:
+            _install_params[_key] = _val
+    install_result = plugin_install_task(_install_params, retry=retry, timeout=timeout)
 
     install_ok = _task_success(install_result)
     steps.append({
@@ -544,46 +595,17 @@ def plugin_upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int
             error_message=_task_message(install_result),
         )
 
-    # ── Step 5: 启动新版本（start_task 从运行区 bin/ 读取脚本）──
-    logging.info("[plugin_upgrade_task] 启动新版本服务")
-    start_result = plugin_start_task({
-        "task_id": task_id,
-        "service_name": service_name,
-        "version": new_version,
-        "sub_dir": _SUB_DIR,
-    }, retry=retry, timeout=timeout)
-
-    start_ok = _task_success(start_result)
-    start_data = start_result.get("data", {})
-    steps.append({
-        "step": "start",
-        "success": start_ok,
-        "message": _task_message(start_result),
-        "data": start_data,
-    })
-
-    if not start_ok:
-        rollback_info = _rollback(service_name, current_version, new_version, was_running, timeout)
-        return _build_result(
-            task_id, False, f"启动新版本失败，已回滚: {_task_message(start_result)}",
-            data={
-                "service_name": service_name,
-                "current_version": current_version,
-                "new_version": new_version,
-                "steps": steps,
-                "rollback": rollback_info,
-            },
-            error_type="UpgradeStartFailed",
-            error_message=_task_message(start_result),
-        )
-
+    # ── Step 5: 不再自动启动 ──
+    # 升级只做「卸载旧版本 + 安装新版本」两步（分别对应包里的 bin/uninstall.sh、bin/install.sh）。
+    # 启不启动交给插件自己 —— 插件往 <节点IP>_out 队列上报，平台按上报更新实例状态
+    # （插件队列监控 PluginQueueMonitorTask：status=Uninstalled 成功 → 实例状态=运行）。
+    logging.info("[plugin_upgrade_task] 升级完成（卸载+安装），不自动启动新版本")
     return _build_result(task_id, True, "升级完成", data={
         "status": "upgraded",
         "service_name": service_name,
         "old_version": current_version,
         "new_version": new_version,
         "component_dir": component_dir,
-        "pid": start_data.get("pid", ""),
         "steps": steps,
     })
 

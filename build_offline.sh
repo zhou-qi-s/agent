@@ -63,6 +63,7 @@ echo "[INFO] 开始 Nuitka 打包..."
   --include-package=core \
   --include-package=utils \
   --include-data-file=config.yaml=config.yaml \
+  --include-data-file=kubeconfig.yaml=kubeconfig.yaml \
   --include-data-file=core/remove-k8s.sh=core/remove-k8s.sh \
   --output-dir="$OUTPUT_DIR" \
   --remove-output \

@@ -161,3 +161,16 @@ def get_apps_dir() -> str:
     cfg = load_config()
     raw = cfg.get("server", {}).get("apps", "")
     return _normalize_dir(raw) or DEFAULT_APPS_DIR
+
+
+def get_runtime_base_dirs() -> list:
+    """
+    对外暴露「运行时基础目录」列表（exe 同目录、PyInstaller 临时目录、
+    启动命令所在目录、项目根目录）。
+
+    用途：定位随包一起发布的文件（例如 `kubeconfig.yaml`）——
+    它在开发环境（源码目录）和 Nuitka 编译产物（main.dist/）下位置一致，
+    都取这些基础目录中的第一个命中项。
+    """
+    return _get_runtime_base_dirs()
+

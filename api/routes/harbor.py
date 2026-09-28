@@ -19,6 +19,7 @@ from api.utils.harbor_util import (
     parse_chart_info,
     build_display_url,
     build_oci_registry,
+    build_chart_registry_addr,
     safe_error_handler,
 )
 
@@ -338,7 +339,8 @@ async def push_chart_to_harbor(
     流程：
     1. 在 config.yaml 的 harbor.download 目录下查找 .tgz 文件
     2. 读取 harbor 配置（agreement、port、username、password、template）
-    3. 通过 helm push 命令上传 Chart 到 Harbor 的 template 项目（使用回环地址避免证书问题）
+    3. 通过 helm push 上传 Chart 到 Harbor 的 template 项目
+       （地址用真实 IP + HTTPS 口，理由见 harbor_util.build_chart_registry_addr 的说明）
     4. 删除临时文件
     """
     download_dir = get_download_dir()
@@ -360,20 +362,29 @@ async def push_chart_to_harbor(
     port_str = conn["port_str"]
     project = conn["project"]
     is_https = conn["is_https"]
-    harbor_addr_local = conn["harbor_addr_local"]
 
-    oci_registry = build_oci_registry(harbor_addr_local, project)
+    # ★ 2026-09-27 修复：Chart 不能用 harbor_addr_local（回环 127.0.0.1）——
+    #   实测回环地址上 helm 会强制走明文 HTTP：HTTP 口(30002)会 308 跳 https 把 push 流打断
+    #   （unexpected EOF），HTTPS 口(30003)它反而用 http 去连（400）。
+    #   改用真实 IP + HTTPS 口（平台约定 = Harbor 端口 + 1），登录/推送均实测成功。
+    chart_addr = build_chart_registry_addr(repository, port_str, is_https)
+
+    oci_registry = build_oci_registry(chart_addr, project)
     steps = []
 
     try:
         # Step 1: helm registry login
-        logging.info("[%s] Helm 登录 Harbor: %s", LOG_PUSH_CHART, harbor_addr_local)
+        #   ★ 2026-09-27 修复：原来这里按 is_https 追加参数，HTTP 时加的是 --plain-http ——
+        #     但 helm 的 registry login【没有】这个参数（只有 helm push 有），
+        #     目标机 helm v3.16.4 实测直接报 `Error: unknown flag: --plain-http`，
+        #     导致 Chart 一步都推不上去。现在固定用 HTTPS 口 + --insecure（合法参数）。
+        logging.info("[%s] Helm 登录 Harbor: %s", LOG_PUSH_CHART, chart_addr)
         login_cmd = [
-            "helm", "registry", "login", harbor_addr_local,
+            "helm", "registry", "login", chart_addr,
             "-u", username,
             "--password-stdin",
+            "--insecure",
         ]
-        login_cmd.append("--insecure" if is_https else "--plain-http")
         run_command(
             login_cmd, timeout=30, input_str=password,
             log_prefix=LOG_PUSH_CHART, step_name="helm_login",
@@ -381,9 +392,12 @@ async def push_chart_to_harbor(
         )
 
         # Step 2: helm push
+        #   地址已是 HTTPS 口 → 用 --insecure-skip-tls-verify（push 的合法参数，跳过自签证书校验）
         logging.info("[%s] 推送 Chart: %s -> %s", LOG_PUSH_CHART, chart_path, oci_registry)
-        push_cmd = ["helm", "push", chart_path, oci_registry]
-        push_cmd.append("--insecure-skip-tls-verify" if is_https else "--plain-http")
+        push_cmd = [
+            "helm", "push", chart_path, oci_registry,
+            "--insecure-skip-tls-verify",
+        ]
         run_command(
             push_cmd, timeout=300, log_prefix=LOG_PUSH_CHART,
             step_name="helm_push", step_desc="helm push", steps=steps,
@@ -404,7 +418,8 @@ async def push_chart_to_harbor(
 
         # 解析 Chart 信息
         chart_name, chart_version, chart_ref = parse_chart_info(file_name)
-        display_harbor_url = build_display_url(agreement, repository, port_str)
+        # 展示地址也用真实推送地址（原来拼的是 agreement+ip+HTTP端口，与实际推的地址不一致）
+        display_harbor_url = f"https://{chart_addr}"
 
         return {
             "code": 200,
@@ -416,7 +431,7 @@ async def push_chart_to_harbor(
                 "chart_name": chart_name,
                 "chart_version": chart_version,
                 "harbor_url": display_harbor_url,
-                "oci_registry": f"oci://{repository}{':' + port_str if port_str else ''}/{project}",
+                "oci_registry": oci_registry,
                 "steps": steps,
             }
         }

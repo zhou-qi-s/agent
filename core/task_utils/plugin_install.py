@@ -261,6 +261,53 @@ def plugin_install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int
 
     logging.info(f"[插件安装] 定位到安装脚本: {script_path}")
 
+    # ── 第六步之后：生成「队列配置文件」（平台下发了 install_dir 才做）──
+    # 平台在「插件安装」弹窗里让用户填一个文件夹位置，并随任务下发：
+    #   install_dir        —— 目标文件夹（节点上的绝对路径）
+    #   queue_file_name    —— 文件名（默认 queue.properties）
+    #   queue_file_content —— 文件内容（两行：输入/输出队列名，值为「节点IP_后缀」）
+    # 顺序要求：**先写文件，再执行安装脚本**（安装脚本要读这份配置）。
+    install_dir = str(parameters.get("install_dir", "") or "").strip()
+    queue_file_name = str(parameters.get("queue_file_name", "") or "").strip()
+    queue_file_content = parameters.get("queue_file_content", "") or ""
+    queue_file_path = ""
+    if install_dir or queue_file_name or queue_file_content:
+        if not install_dir:
+            return _build_result(
+                task_id, False, "参数缺失: install_dir",
+                data={"file_name": file_name, "version": version, "sub_dir": sub_dir},
+                error_type="ParameterMissing",
+                error_message="平台要求生成队列配置文件，但未下发 install_dir（文件夹位置）",
+            )
+        if not os.path.isabs(install_dir):
+            return _build_result(
+                task_id, False, f"install_dir 必须是绝对路径: {install_dir}",
+                data={"file_name": file_name, "version": version, "sub_dir": sub_dir,
+                      "install_dir": install_dir},
+                error_type="InvalidInstallDir",
+                error_message=f"生成队列配置文件的文件夹必须是绝对路径: {install_dir}",
+            )
+        if not queue_file_name:
+            queue_file_name = "queue.properties"
+        queue_file_path = os.path.join(install_dir, queue_file_name)
+        try:
+            os.makedirs(install_dir, exist_ok=True)
+            with open(queue_file_path, "w", encoding="utf-8") as f:
+                f.write(str(queue_file_content))
+            logging.info(f"[插件安装] 已生成队列配置文件: {queue_file_path}")
+            logging.info("[插件安装] 队列配置文件内容: %s",
+                         str(queue_file_content).replace("\n", " | "))
+        except Exception as e:
+            logging.error(f"[插件安装] 生成队列配置文件失败: {queue_file_path}: {e}")
+            return _build_result(
+                task_id, False, f"生成队列配置文件失败: {e}",
+                data={"file_name": file_name, "version": version, "sub_dir": sub_dir,
+                      "install_dir": install_dir, "queue_file_path": queue_file_path},
+                error_type="QueueFileWriteError",
+                error_message=str(e),
+                tb=traceback.format_exc(),
+            )
+
     # ── 执行安装脚本 ──
     script_timeout = timeout if timeout > 0 else 300
     try:

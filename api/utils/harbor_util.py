@@ -204,6 +204,39 @@ def build_oci_registry(harbor_addr_local: str, project: str) -> str:
     return f"oci://{harbor_addr_local}/{project}"
 
 
+def build_chart_registry_addr(repository: str, port_str: str, is_https: bool) -> str:
+    """
+    构建【Chart(helm) 推送专用】的仓库地址：真实 IP + HTTPS 端口。
+
+    为什么不能用 harbor_addr_local（回环 127.0.0.1）——2026-09-27 实测：
+        · 回环 + HTTP 口(如 30002)：Harbor 对 registry API 会返回 308 跳转到 https，
+          push 的请求流会被打断，报 `failed to read expected number of bytes: unexpected EOF`；
+        · 回环 + HTTPS 口：helm 反而强制用明文 http 去连，报 400。
+    改用真实 IP + HTTPS 口后，配合节点系统信任库里的平台 CA
+    （装 Harbor 时已下发 /usr/local/share/ca-certificates/harbor-ca.crt 并 update-ca-certificates），
+    `helm registry login` 与 `helm push` 均稳定成功（已实测）。
+
+    Args:
+        repository: 本机/节点真实 IP（get_repository_ip()）
+        port_str:   config.yaml 里 harbor.port
+        is_https:   配置里的 agreement 是否已经是 https（是则端口原样用）
+
+    Returns:
+        "ip:port"（HTTPS 端口）
+    """
+    host = (repository or "127.0.0.1").strip()
+    port = (str(port_str) or "").strip()
+    if not port:
+        return host
+    if is_https:
+        return f"{host}:{port}"
+    # 平台约定：Harbor 的 HTTP 端口 + 1 = HTTPS 端口（如 30002 / 30003）
+    try:
+        return f"{host}:{int(port) + 1}"
+    except ValueError:
+        return f"{host}:{port}"
+
+
 def safe_error_handler(log_prefix: str, e: Exception, error_desc: str):
     """统一的异常处理：HTTPException 直接抛出，其他包装为 500"""
     if isinstance(e, HTTPException):

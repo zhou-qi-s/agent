@@ -26,10 +26,15 @@ import time
 from typing import Any, Dict, List
 
 import utils.util
-from utils.config_loader import load_config
+from utils.config_loader import load_config, get_runtime_base_dirs
 from utils.redis_store import RedisStore
 
 _LOG = "helm_list"
+
+# 随包一起发布的 kubeconfig 文件名（打包时放在 config.yaml 同级目录）
+# 用途：Harbor 节点通常没装 K8s、天生没有 /etc/kubernetes/admin.conf，
+# 而容器部署（helm）要求执行机上有集群管理员 kubeconfig —— 由它补齐。
+_PACKAGED_KUBECONFIG = "kubeconfig.yaml"
 
 
 def _run_command(cmd: list, timeout: int = 60) -> tuple:
@@ -121,6 +126,87 @@ def init_kubeconfig() -> bool:
     os.environ["KUBECONFIG"] = kubeconfig_path
     logging.info("[%s] KUBECONFIG 已设置为: %s", _LOG, kubeconfig_path)
     return True
+
+
+def install_packaged_kubeconfig() -> bool:
+    """
+    把「随包发布的 kubeconfig」安装到配置文件指定的位置。
+
+    要解决的问题：
+        容器部署（helm）要求执行机上有集群管理员 kubeconfig，
+        而 Harbor 节点通常是独立一台机、没装 K8s，
+        天生没有 /etc/kubernetes/admin.conf —— 于是容器部署一上来就失败。
+        现在打包时把平台那份 kubeconfig 一起带上（包内 `kubeconfig.yaml`），
+        Agent 每次启动时按配置把它放到位（顺带把父目录建好）。
+
+    目标路径取值顺序（都来自 config.yaml）：
+        k8s.kubeconfig → k8s.download → helm.config
+
+    行为：
+        · 目标文件已存在 → 保留不动（不覆盖平台/人工放的凭证）
+        · 目标文件不存在但包里也没有 kubeconfig.yaml → 记警告、不报错、不阻断启动
+        · 无论如何都会把目标文件的父目录建好
+          （容器部署要在该目录下写临时 kubeconfig，目录不存在同样会失败）
+
+    返回:
+        True 目标文件已就位（含本来就在），False 未就位
+    """
+    config = load_config()
+    k8s_cfg = config.get("k8s", {}) or {}
+    helm_cfg = config.get("helm", {}) or {}
+
+    target = (
+            (k8s_cfg.get("kubeconfig") or "").strip()
+            or (k8s_cfg.get("download") or "").strip()
+            or (helm_cfg.get("config") or "").strip()
+    )
+    if not target:
+        logging.warning("[%s] k8s.kubeconfig 未配置，跳过 kubeconfig 安装", _LOG)
+        return False
+
+    target_dir = os.path.dirname(target) or "/"
+
+    # ① 父目录先建好（容器部署要在这个目录里写临时 kubeconfig）
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as e:
+        logging.error("[%s] 创建目录失败 %s: %s", _LOG, target_dir, e)
+        return False
+
+    # ② 已存在就不动它
+    if os.path.exists(target):
+        logging.info("[%s] kubeconfig 已存在，保持不变: %s", _LOG, target)
+        return True
+
+    # ③ 从包内找 kubeconfig.yaml（与 config.yaml 同级）
+    src = None
+    for base in get_runtime_base_dirs():
+        candidate = os.path.join(base, _PACKAGED_KUBECONFIG)
+        if os.path.exists(candidate):
+            src = candidate
+            break
+
+    if not src:
+        logging.warning(
+            "[%s] 包内没有 %s，未安装 kubeconfig（容器部署可能失败）",
+            _LOG, _PACKAGED_KUBECONFIG
+        )
+        return False
+
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+        with open(target, "wb") as f:
+            f.write(data)
+        os.chmod(target, 0o600)
+        logging.info(
+            "[%s] 已安装 kubeconfig: %s -> %s（%d 字节）",
+            _LOG, src, target, len(data)
+        )
+        return True
+    except Exception as e:
+        logging.error("[%s] 安装 kubeconfig 失败: %s", _LOG, e)
+        return False
 
 
 def sync_helm_list() -> List[Dict[str, Any]]:

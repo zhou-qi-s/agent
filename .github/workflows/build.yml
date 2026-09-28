@@ -32,6 +32,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
 
+      - name: Install python deps
+        # build_offline.sh 是"离线打包脚本"，它假设依赖已装 —— 这里显式装上（幂等，装过也不报错）
+        run: |
+          python3 -m pip install -U pip setuptools wheel
+          python3 -m pip install -U nuitka ordered-set zstandard
+          python3 -m pip install -r requirements.txt
+          python3 -c "import psutil, requests, redis, yaml; print('base deps ok')"
+          python3 -c "import fastapi, uvicorn, websockets, httptools, anyio, h11; print('fastapi deps ok')"
+
       - name: Build with Nuitka
         run: |
           # ★ 必须用 build_offline.sh（完整离线打包流水线）：
@@ -70,6 +79,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip python3-dev gcc patchelf ccache
+
+      - name: Install python deps
+        # build_offline.sh 是"离线打包脚本"，它假设依赖已装 —— 这里显式装上（幂等，装过也不报错）
+        run: |
+          python3 -m pip install -U pip setuptools wheel
+          python3 -m pip install -U nuitka ordered-set zstandard
+          python3 -m pip install -r requirements.txt
+          python3 -c "import psutil, requests, redis, yaml; print('base deps ok')"
+          python3 -c "import fastapi, uvicorn, websockets, httptools, anyio, h11; print('fastapi deps ok')"
 
       - name: Build with Nuitka
         run: |

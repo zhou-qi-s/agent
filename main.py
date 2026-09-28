@@ -15,7 +15,7 @@ import traceback
 
 from core.heartbeat import heartbeat_loop
 from core.host_resource import host_resource_loop
-from core.helm import init_kubeconfig, sync_helm_list
+from core.helm import init_kubeconfig, sync_helm_list, install_packaged_kubeconfig
 from core.register import register_agent
 from core.task_utils import task_loop
 from core.k8s_agent import k8s_task_loop
@@ -86,6 +86,18 @@ def main():
         logger.info("=" * 50)
         logger.info("Agent 系统启动中...")
         logger.info("=" * 50)
+
+        # ========== 安装随包发布的 kubeconfig ==========
+        # Harbor 节点通常是独立一台机、没装 K8s，默认没有 /etc/kubernetes/admin.conf，
+        # 会导致容器部署直接失败（报 k8s.download 目录不存在）。
+        # 打包时已把平台那份 kubeconfig 带进包内（kubeconfig.yaml），这里按配置放到位。
+        try:
+            if install_packaged_kubeconfig():
+                logger.info("kubeconfig 已就位")
+            else:
+                logger.warning("kubeconfig 未就位（容器部署可能失败）")
+        except Exception as e:
+            logger.error(f"安装 kubeconfig 异常（不影响其它功能）: {e}")
 
         # ========== 启动 FastAPI API 服务 ==========
         logger.info("启动 FastAPI 管理接口...")
