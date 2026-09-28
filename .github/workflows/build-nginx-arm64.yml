@@ -1,0 +1,57 @@
+name: Build static nginx (ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "nginx version"
+        required: true
+        default: "1.30.4"
+
+jobs:
+  build-arm64:
+    name: Build nginx arm64 static
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Show runner
+        run: |
+          uname -m
+          gcc --version | head -1
+          nproc
+
+      - name: Build static nginx
+        run: |
+          set -eux
+          V="${{ github.event.inputs.version }}"
+          curl -fsSL -o nginx.tar.gz "https://nginx.org/download/nginx-${V}.tar.gz"
+          tar xzf nginx.tar.gz
+          cd "nginx-${V}"
+          # 插件包里的 nginx 是「静态链接、not stripped」的，这里照同样套路编：
+          #   · 只开配置里真正用到的模块（gzip_static / stub_status），其余默认
+          #   · -static 静态链接（目标机不用装任何 so）
+          ./configure \
+            --prefix=/tmp/nginx \
+            --with-http_gzip_static_module \
+            --with-http_stub_status_module \
+            --with-cc-opt="-static -O2" \
+            --with-ld-opt="-static"
+          make -j"$(nproc)"
+
+      - name: Collect binary
+        run: |
+          set -eux
+          V="${{ github.event.inputs.version }}"
+          BIN="nginx-${V}/objs/nginx"
+          file "$BIN"
+          ls -la "$BIN"
+          "$BIN" -V 2>&1 | head -3
+          cp "$BIN" /tmp/nginx-arm64-static.bin
+          chmod +x /tmp/nginx-arm64-static.bin
+          sha256sum /tmp/nginx-arm64-static.bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-arm64-static
+          path: /tmp/nginx-arm64-static.bin
+          retention-days: 7
