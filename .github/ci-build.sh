@@ -21,16 +21,19 @@
 set -euxo pipefail
 
 echo '================ 编译环境（决定产物 glibc floor）================'
-head -3 /etc/os-release || true
-ldd --version | head -1
-gcc --version | head -1 || true
-echo '==============================================================='
+cat /etc/os-release || true
 
 # 1) 装编译环境（容器里跑；glibc 由镜像决定，不装任何 glibc 相关东西）
 if command -v dnf >/dev/null 2>&1; then
   dnf install -y gcc gcc-c++ binutils make tar gzip python39 python39-devel python39-pip \
     || { dnf module enable -y python39 && dnf install -y gcc gcc-c++ binutils make tar gzip python39 python39-devel python39-pip; }
 fi
+
+# ★ 注意：这里【不要】写 `xxx --version | head -1` —— head 读一行就关管道，
+#   xxx 收到 SIGPIPE 退出码 141，配上 set -o pipefail 会让整个脚本直接失败（已踩过）。
+ldd --version || true
+gcc --version || true
+echo '==============================================================='
 
 # 2) 挑 python：优先 python3.9（带共享 libpython），其次 PYTHON_BIN 指定，最后 python3
 if [ -n "${PYTHON_BIN:-}" ] && [ -x "${PYTHON_BIN}" ]; then
