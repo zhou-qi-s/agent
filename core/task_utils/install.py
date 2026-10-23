@@ -37,6 +37,7 @@ from utils.app_path import (
     find_cache_version_dir,
     list_cache_versions,
     find_apps_component_dir,
+    get_state_dir,
     read_state,
     write_state,
     is_running,
@@ -106,6 +107,8 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
     可选参数:
         - retry:     重试次数（暂未使用，保留兼容）
         - timeout:   脚本执行超时秒数
+    ★信任脚本模式：安装位置由脚本自己决定（写死在脚本里），平台不下发、
+      不要求回执；应用是否在跑由 app.yaml name 的进程巡检刷新。
     """
     task_id = str(parameters.get("task_id", "") or "").strip()
     file_name = str(parameters.get("file_name", "") or "").strip()
@@ -263,7 +266,7 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
         )
     logging.info(f"[安装任务] 运行状态已更新: {state}")
 
-    # ── 第六步：定位安装脚本（运行区，经软链接访问） ──
+    # ── 定位安装脚本（运行区，经软链接访问） ──
     # 从运行区寻址，使脚本内 $(dirname $0)/.. 落在运行区，
     # 与运行时 bin/app/config 的访问路径一致。
     script_path = _find_install_script(app_dir)
@@ -280,12 +283,30 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
 
     logging.info(f"[安装任务] 定位到安装脚本: {script_path}")
 
+    # ── 组装脚本环境变量 ──
+    # AGENT_STATE_DIR：Agent 的状态目录，脚本如有 pid/日志记账需求可用（可忽略）。
+    # ★信任脚本模式：安装位置由脚本自己决定（写死在脚本里，从下载区搬文件），
+    #   平台不再下发 INSTALL_PATH，也不要求脚本写回执——应用运行状态由
+    #   app.yaml name 的进程巡检刷新（core/process/process_info.py）。
+    state_dir = get_state_dir(file_name) or ""
+    script_env = {
+        "APP_NAME": file_name,
+        "VERSION": version,
+    }
+    if state_dir:
+        script_env["AGENT_STATE_DIR"] = state_dir
+
     # ── 执行安装脚本 ──
+    # leave_on_timeout=True：脚本超时未退出不杀（可能在前台常驻），转后台观察，
+    # task 层会在脚本真正退出后补报终态。
     script_timeout = timeout if timeout > 0 else 300
     try:
         result = Shell.run_script(
             script_path=script_path,
             timeout=script_timeout,
+            env=script_env,
+            leave_on_timeout=True,
+            task_id=task_id,
         )
 
         if result.success:
@@ -302,6 +323,23 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
                     "exit_code": result.code,
                     "stdout": result.stdout,
                 },
+            )
+        elif getattr(result, "still_running", False):
+            # 挂起：Shell 层已登记，task 层会置「执行中」并安排观察补报。
+            logging.warning(f"[安装任务] 安装脚本转为后台观察: {script_path}")
+            return _build_result(
+                task_id,
+                False,
+                "安装脚本仍在执行中（已转后台观察，不会被终止）",
+                data={
+                    "status": "install_running",
+                    "file_name": file_name,
+                    "version": version,
+                    "script_path": script_path,
+                    "stdout": result.stdout,
+                },
+                error_type="ScriptStillRunning",
+                error_message=result.stderr,
             )
         else:
             logging.error(f"[安装任务] 安装脚本执行失败: exit_code={result.code}, stderr={result.stderr}")

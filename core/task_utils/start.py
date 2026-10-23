@@ -17,9 +17,12 @@ from utils.app_path import (
     find_apps_component_dir,
     list_cache_versions,
     get_pid_file,
-    read_pid,
+    get_state_dir,
     read_pids_from_file,
+    read_pid,
     read_state,
+    resolve_bin_dir,
+    build_script_env,
     write_state,
     wait_process_alive,
     get_process_names,
@@ -76,11 +79,13 @@ def _resolve_paths(service_name: str, version: str) -> tuple:
         2. 在运行区定位组件目录        {server.apps}/{service_name}/
            —— 由 install 阶段建立软链接结构，
               bin/ 经 current/bin 指向缓存区，脚本从运行区执行
+        3. 有安装回执（manifest）时优先用回执记录的实际安装位置找 bin/
+           —— 应用可能被 install.sh 装到运行区以外（甲方要求的自定义位置）
 
     返回:
         (error, component_dir, version, bin_dir)
         - 出错: (error_result, "", "", "")
-        - 正常: (None, 运行区组件目录, version, 运行区 bin 目录)
+        - 正常: (None, 运行区组件目录, version, bin 目录)
     """
     if not _DOWNLOAD_BASE:
         return (
@@ -134,10 +139,10 @@ def _resolve_paths(service_name: str, version: str) -> tuple:
             "", "", "",
         )
 
-    # bin 目录：{apps}/{service_name}/bin
-    # 这是指向 current/bin 的软链接，而 install 阶段已把 current 指向目标版本，
-    # 因此此处实际执行的就是 {version}/bin 下的脚本。
-    bin_dir = os.path.join(component_dir, "bin")
+    # bin 目录：优先按安装回执的实际安装位置（{install_path}/bin），
+    # 没有回执或位置不存在时回落 {apps}/{service_name}/bin（指向 current/bin 的软链接）。
+    fallback_bin = os.path.join(component_dir, "bin")
+    bin_dir = resolve_bin_dir(service_name, fallback_bin)
 
     return None, component_dir, version, bin_dir
 
@@ -247,16 +252,26 @@ def _read_script(bin_dir: str) -> tuple:
     return content, script_path
 
 
-def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, Any]:
+def _execute_script(script_path: str, bin_dir: str, timeout: int,
+                    env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """执行启动脚本，返回执行结果。
+
+    env: 传给脚本的额外环境变量（INSTALL_PATH / AGENT_STATE_DIR 等，
+         与当前进程环境合并后下发）。
 
     返回字段: success, exit_code, stdout, stderr
     """
     try:
+        if env:
+            merged_env = os.environ.copy()
+            merged_env.update({str(k): str(v) for k, v in env.items()})
+        else:
+            merged_env = None
         if os.name == "nt":
             proc = subprocess.Popen(
                 [script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -266,6 +281,7 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
             proc = subprocess.Popen(
                 ["bash", script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -274,13 +290,18 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            # ★信任脚本模式：超时【不杀】。前台常驻的启动脚本（脚本不退出 = 应用在跑）
+            # 是合法形态；杀掉脚本等于杀掉应用。标记 still_running 交由进程巡检判活。
+            logging.warning(
+                "[start_task] 启动脚本 %ss 未退出（前台常驻？），保留进程不杀: %s",
+                timeout, script_path,
+            )
             return {
-                "success": False,
-                "exit_code": -1,
-                "stdout": stdout.strip() if stdout else "",
-                "stderr": f"脚本执行超时 ({timeout}s)",
+                "success": True,
+                "still_running": True,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": f"启动脚本超过 {timeout}s 未退出（前台常驻？已保留进程，由进程巡检判活）",
             }
 
         return {
@@ -392,19 +413,13 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
 
     logging.info("[start_task] 启动脚本已读取: %s", script_path)
 
-    # ── 脚本规则校验 ──
+    # ── 脚本规则校验（降级为警告）──
+    # ★信任脚本模式：不再强制"后台启动/写PID/exit"三规则——脚本怎么写是用户自由
+    #（前台常驻、systemd 托管等都是合法形态），校验结果只记日志与回报数据。
     violations = _validate_script(script_content)
     if violations:
-        return _build_result(
-            task_id, False, f"脚本不符合启动规则（{len(violations)}项）",
-            data={
-                "service_name": service_name,
-                "version": version,
-                "bin_dir": bin_dir,
-                "violations": violations,
-            },
-            error_type="ScriptValidationError",
-            error_message="; ".join(violations),
+        logging.warning(
+            "[start_task] 启动脚本未符合推荐规则（不阻断）: %s", "; ".join(violations)
         )
 
     # ── runtime / pid 路径 ──
@@ -431,6 +446,9 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
         )
 
     # ── 执行启动脚本 ──
+    # 环境变量告知脚本实际安装位置（INSTALL_PATH）与状态目录（AGENT_STATE_DIR，
+    # pid 统一写到 $AGENT_STATE_DIR/pid），应用装在运行区以外时也能正确启动。
+    script_env = build_script_env(service_name, version)
     base_data = {
         "service_name": service_name,
         "version": version,
@@ -439,9 +457,10 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
         "script_path": script_path,
         "runtime_dir": runtime_dir,
         "pid_file": pid_file,
+        "install_path": script_env.get("INSTALL_PATH", ""),
     }
     exec_timeout = min(timeout, 60)  # 脚本自身应在数秒内返回
-    exec_result = _execute_script(script_path, bin_dir, exec_timeout)
+    exec_result = _execute_script(script_path, bin_dir, exec_timeout, env=script_env)
     logging.info(
         "[start_task] 脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
         exec_result["exit_code"], exec_result.get("stdout", ""), exec_result.get("stderr", ""),
@@ -460,36 +479,18 @@ def start_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) -
             error_message=exec_result.get("stderr", "") or f"脚本退出码: {exec_result['exit_code']}",
         )
 
-    # ── 读取脚本写入的 PID（支持多值）──
+    # ── 读取脚本写入的 PID（可选）──
+    # ★信任脚本模式：pid 文件不再是必要条件——脚本可以不写（前台常驻、systemd 托管等）。
+    # 写了就记录进 state（详情展示用），没写也不影响启动成功；
+    # 应用是否真的在跑由 app.yaml name 的进程巡检判定（process_info.py）。
     pids = read_pids_from_file(service_name)
-    if not pids:
-        return _build_result(
-            task_id, False, f"启动脚本未写入 pid 文件: {pid_file}",
-            data={**base_data, "exit_code": exec_result["exit_code"],
-                  "stdout": exec_result.get("stdout", "")},
-            error_type="PidFileMissing",
-            error_message="启动脚本执行完成但未找到 pid 文件，请检查 start.sh 是否写入 $!",
-        )
-    logging.info("[start_task] 读取到 PID 列表: %s，等待 %s 秒确认存活",
-                 pids, START_CONFIRM_WAIT)
+    if pids:
+        logging.info("[start_task] 脚本写入了 PID: %s", pids)
+    else:
+        logging.info("[start_task] 脚本未写 pid 文件（信任脚本模式，不做强制）")
 
-    # ── 等待并确认进程存活（多 pid 全部存活才算通过）──
-    # 同步等待：避免"秒退"被误判为启动成功，平台拿到的是终态
-    alive = wait_process_alive(service_name, pids, START_CONFIRM_WAIT)
-    if not alive:
-        return _build_result(
-            task_id, False,
-            f"进程 {pids} 在 {START_CONFIRM_WAIT} 秒内已有退出，启动失败",
-            data={**base_data, "pids": pids, "exit_code": exec_result["exit_code"],
-                  "stdout": exec_result.get("stdout", ""),
-                  "stderr": exec_result.get("stderr", "")},
-            error_type="ProcessNotAlive",
-            error_message=f"启动后 {START_CONFIRM_WAIT} 秒内进程未全部存活",
-        )
-    logging.info("[start_task] PID %s 存活确认通过", pids)
-
-    # ── 写入运行状态：pids + processes + runtime=true ──
-    processes = get_process_names(pids)
+    # ── 写入运行状态：runtime=true（pids 可能为空，运行状态以进程巡检为准）──
+    processes = get_process_names(pids) if pids else []
     state = read_state(service_name)
     state.update({
         "pids": pids,

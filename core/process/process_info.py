@@ -126,6 +126,128 @@ def _get_children_pids(pid: int) -> List[int]:
         return []
 
 
+def _resolve_version(service_name: str, sub_dir: str = "") -> str:
+    """
+    解析服务当前生效的版本号（信任脚本模式的版本判定依据）。
+
+    优先解析运行区的 current 软链：{apps}[/{sub_dir}]/{服务名}/current
+        → 指向 {download}[/{sub_dir}]/{服务名}/{版本}
+        → 取链接目标 basename 即为版本号。
+
+    为什么不用 state.version：start 任务会把下发的 version 参数写回
+    state/config.yaml —— 如果 start 是按旧绑定（旧应用）发起的，
+    state.version 会被覆盖回旧值，巡检就会拿旧版本目录的 app.yaml
+    去匹配进程名。current 软链只反映 install 真正落地的版本，更可靠。
+
+    解析失败（软链不存在/损坏）时回退 state.version。
+
+    参数:
+        service_name: 服务名（运行区目录名）
+        sub_dir:      应用类别层（"" / displayConsole / plugin）
+
+    返回:
+        版本号字符串（可能为空）
+    """
+    root = _APPS_BASE
+    if sub_dir:
+        root = os.path.join(root, sub_dir)
+    current_link = os.path.join(root, service_name, "current")
+    try:
+        if os.path.islink(current_link):
+            target = os.readlink(current_link)
+            # 相对链接按链接所在目录解析
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(current_link), target)
+            target = os.path.normpath(target)
+            version = os.path.basename(target)
+            if version and version != service_name:
+                return version
+    except OSError as e:
+        logging.warning("[版本巡检] 解析 current 软链失败: %s -> %s", current_link, e)
+
+    # 回退：state.version
+    state = read_state(service_name, sub_dir)
+    if state:
+        return str(state.get("version", "") or "").strip()
+    return ""
+
+
+def _read_proc_name(service_name: str, version: str, sub_dir: str = "") -> str:
+    """
+    读版本目录 config/app.yaml 的 name 字段作为进程名（信任脚本模式下唯一的匹配依据）。
+
+    app.yaml 是应用包自带元数据，跟随版本走；没有 name 字段时回退用服务名
+    （目录名）匹配——兜底行为，正常包都应声明 name。
+
+    参数:
+        service_name: 服务名（运行区/下载区目录名）
+        version:      版本号
+        sub_dir:      应用类别层
+
+    返回:
+        进程名
+    """
+    base = _DOWNLOAD_BASE
+    if sub_dir:
+        base = os.path.join(base, sub_dir)
+    yaml_path = os.path.join(base, service_name, version, "config", "app.yaml")
+    if os.path.isfile(yaml_path):
+        try:
+            import yaml
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                meta = yaml.safe_load(f) or {}
+            name = str(meta.get("name", "") or "").strip()
+            if name:
+                return name
+            logging.warning("[name巡检] app.yaml 缺少 name 字段，回退用服务名匹配: %s", yaml_path)
+        except Exception as e:
+            logging.warning("[name巡检] 读 app.yaml 失败: %s -> %s", yaml_path, e)
+    else:
+        logging.warning("[name巡检] app.yaml 不存在，回退用服务名匹配: %s", yaml_path)
+    return service_name
+
+
+def _match_processes_by_name(proc_name: str) -> List[int]:
+    """
+    按进程名精准匹配节点上的进程（可匹配多个——一个应用多进程是正常形态）。
+
+    参数:
+        proc_name: app.yaml 声明的进程名
+
+    返回:
+        匹配到的 PID 列表（可能为空）
+    """
+    matched: List[int] = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if proc.info["name"] == proc_name:
+                matched.append(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return matched
+
+
+def _build_app_agg_entry(service_name: str, version: str, proc_name: str,
+                         matched_pids: List[int], timestamp: int) -> Dict[str, Any]:
+    """
+    构建应用级聚合条目（平台刷实例状态的依据）。
+
+    写入 Redis 键 App/{ip}/{服务名}（List，保留最近 15 条，与 Process/ 键同模式）。
+    running 只看是否有匹配进程，与启动方式无关（平台内外启动一视同仁）。
+    """
+    return {
+        "agg": True,
+        "key": f"App/{get_ip()}/{service_name}",
+        "service_name": service_name,
+        "version": version,
+        "proc_name": proc_name,
+        "running": bool(matched_pids),
+        "pids": [str(p) for p in matched_pids],
+        "process_count": len(matched_pids),
+        "timestamp": timestamp,
+    }
+
+
 def _build_process_entry(pid: int, service_name: str, version: str,
                          timestamp: int) -> Dict[str, Any]:
     """构建单个进程的采集条目"""
@@ -157,23 +279,56 @@ def _collect_service_processes(
     """
     采集单个服务的进程信息（供线程池并行调用）。
 
-    采集依据：运行区 {apps}[/{sub_dir}]/{服务名}/state/config.yaml
-        - runtime 必须为 true，否则视为未运行
-        - pid 字段支持多个 pid（换行分隔）
-        - 死 pid 会被过滤，并顺带回写状态文件
+    采集依据（虚拟机应用，sub_dir=""）：
+        **按 app.yaml 的 name 精准匹配节点进程**（信任脚本模式）——
+        不管应用是谁启动的（平台 / 用户手动 / systemd），只要进程名对得上就采，
+        多进程全收。app.yaml 没有 name 时回退用服务名匹配。
+        显控台 / 插件（sub_dir 非空）仍走旧的 state/pid 逻辑，互不影响。
+
+    旧依据（仅显控台 / 插件还在用）：
+        运行区 {apps}[/{sub_dir}]/{服务名}/state/config.yaml
+            - runtime 必须为 true，否则视为未运行
+            - pid 字段支持多个 pid（换行分隔）
+            - 死 pid 会被过滤，并顺带回写状态文件
 
     参数:
         service_dir: 运行区服务目录路径 {apps}[/{sub_dir}]/{entry}
         entry:       服务名称（目录名）
         timestamp:   采集时间戳
-        sub_dir:     应用类别层（"" / displayConsole / plugin）——
-                     读状态文件时必须带上，否则显控台/插件服务会读不到 pids（历史缺陷）
+        sub_dir:     应用类别层（"" / displayConsole / plugin）
 
     返回:
         (entry, [进程条目列表])
     """
     processes: List[Dict[str, Any]] = []
 
+    if sub_dir == "":
+        # ── 虚拟机应用：name 巡检（信任脚本模式）──
+        state = read_state(entry, sub_dir)
+        if not state:
+            return (entry, processes)
+        version = _resolve_version(entry, sub_dir)
+        if not version:
+            return (entry, processes)
+        proc_name = _read_proc_name(entry, version)
+        matched = _match_processes_by_name(proc_name)
+        seen: set = set()
+        for pid in matched:
+            processes.append(_build_process_entry(pid, entry, version, timestamp))
+            for child_pid in _get_children_pids(pid):
+                if child_pid not in seen:
+                    seen.add(child_pid)
+                    processes.append(_build_process_entry(child_pid, entry, version, timestamp))
+        if matched:
+            logging.info(
+                "[name巡检] %s: 进程名=%s 匹配 %d 个进程 %s",
+                entry, proc_name, len(matched), matched,
+            )
+        else:
+            logging.debug("[name巡检] %s: 进程名=%s 无匹配进程", entry, proc_name)
+        return (entry, processes)
+
+    # ── 显控台 / 插件：旧 state/pid 逻辑 ──
     # ── 读运行状态 ──
     state = read_state(entry, sub_dir)
     if not state:
@@ -345,13 +500,101 @@ def collect_all_processes(max_workers: int = 8) -> List[Dict[str, Any]]:
     return result
 
 
-def upload_to_redis(processes: List[Dict[str, Any]], expire: int = 600) -> Dict[str, Any]:
+def collect_all_with_agg(max_workers: int = 8) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    将进程信息上传到 Redis。
+    进程采集 + 应用级聚合状态（信任脚本模式的主采集入口）。
+
+    在 collect_all_processes 之外，额外为每个虚拟机应用产出一条聚合条目
+    （App/{ip}/{服务名}）：running 只取决于 name 精准匹配到的进程数，
+    与启动方式无关 —— 平台内外启动一视同仁。
+
+    返回:
+        (进程条目列表, 应用聚合条目列表)
+    """
+    timestamp = int(datetime.now().timestamp() * 1000)
+    processes: List[Dict[str, Any]] = []
+    aggs: List[Dict[str, Any]] = []
+
+    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
+        logging.warning("[collect_all_with_agg] 运行区目录不存在: %s", _APPS_BASE)
+        return processes, aggs
+
+    service_tasks = _iter_service_dirs()
+    if not service_tasks:
+        return processes, aggs
+
+    actual_workers = min(max_workers, len(service_tasks))
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        futures = {
+            executor.submit(_collect_service_with_agg, sd, en, timestamp, sdir): en
+            for sd, en, sdir in service_tasks
+        }
+        for future in as_completed(futures):
+            try:
+                svc_processes, svc_agg = future.result()
+                processes.extend(svc_processes)
+                if svc_agg:
+                    aggs.append(svc_agg)
+            except Exception as e:
+                logging.error("[collect_all_with_agg] 采集异常: %s", e)
+
+    elapsed = time.time() - t_start
+    logging.info(
+        "[collect_all_with_agg] 采集完成: %d 进程 / %d 应用, 耗时 %.1fs",
+        len(processes), len(aggs), elapsed,
+    )
+    return processes, aggs
+
+
+def _collect_service_with_agg(service_dir: str, entry: str, timestamp: int,
+                              sub_dir: str = "") -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    单服务采集（带聚合）。虚拟机应用产出 name 巡检结果 + 聚合条目；
+    显控台/插件走旧 state/pid 逻辑，不产出聚合条目。
+    """
+    if sub_dir != "":
+        processes = _collect_service_processes(service_dir, entry, timestamp, sub_dir)[1]
+        return processes, None
+
+    # ── 虚拟机应用：name 巡检 ──
+    state = read_state(entry, sub_dir)
+    if not state:
+        return [], None
+    version = _resolve_version(entry, sub_dir)
+    if not version:
+        return [], None
+
+    proc_name = _read_proc_name(entry, version)
+    matched = _match_processes_by_name(proc_name)
+
+    processes: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pid in matched:
+        processes.append(_build_process_entry(pid, entry, version, timestamp))
+        for child_pid in _get_children_pids(pid):
+            if child_pid not in seen:
+                seen.add(child_pid)
+                processes.append(_build_process_entry(child_pid, entry, version, timestamp))
+
+    if matched:
+        logging.info("[name巡检] %s: 进程名=%s 匹配 %d 个进程 %s", entry, proc_name, len(matched), matched)
+    else:
+        logging.debug("[name巡检] %s: 进程名=%s 无匹配进程", entry, proc_name)
+
+    agg = _build_app_agg_entry(entry, version, proc_name, matched, timestamp)
+    return processes, agg
+
+
+def upload_to_redis(processes: List[Dict[str, Any]], expire: int = 600,
+                    aggs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """
+    将进程信息与应用聚合状态上传到 Redis。
 
     参数:
         processes: collect_all_processes() 返回的进程列表
         expire:    Redis key 过期时间（秒），默认 600 秒（10 分钟）
+        aggs:      应用聚合状态列表（App/{ip}/{服务名}），可选
 
     返回:
         {"success": true, "uploaded": 2, "failed": 0, "errors": []}
@@ -367,34 +610,55 @@ def upload_to_redis(processes: List[Dict[str, Any]], expire: int = 600) -> Dict[
         logging.error("[upload_to_redis] Redis 连接失败: %s", e)
         return {"success": False, "uploaded": 0, "failed": len(processes), "error": str(e)}
 
+    def _push(key: str, value: Dict[str, Any]):
+        nonlocal uploaded, failed
+        pipe = r.pipeline()
+        pipe.lpush(key, json.dumps(value, ensure_ascii=False))
+        pipe.ltrim(key, 0, 14)
+        pipe.expire(key, expire)
+        pipe.execute()
+        uploaded += 1
+        logging.info("[upload_to_redis] 已上传: %s", key)
+
     for p in processes:
         key = p.get("key", "")
         if not key:
             failed += 1
             errors.append(f"缺少 key: {p.get('service_name', 'unknown')}")
             continue
-
         try:
-            value = json.dumps({
+            _push(key, {
                 "service_name": p.get("service_name", ""),
                 "version": p.get("version", ""),
                 "pid": p.get("pid", ""),
                 "running": p.get("running", False),
                 "process_info": p.get("process_info", {}),
                 "timestamp": p.get("timestamp", ""),
-            }, ensure_ascii=False)
-            # 使用 List 存储，LPUSH 插入头部，LTRIM 保留最近 15 条，设置 10 分钟过期
-            pipe = r.pipeline()
-            pipe.lpush(key, value)
-            pipe.ltrim(key, 0, 14)
-            pipe.expire(key, expire)
-            pipe.execute()
-            uploaded += 1
-            logging.info("[upload_to_redis] 已上传: %s", key)
+            })
         except Exception as e:
             failed += 1
             errors.append(f"{key}: {e}")
             logging.warning("[upload_to_redis] 上传失败: %s -> %s", key, e)
+
+    # 应用聚合状态：平台刷实例状态的依据（运行中/已停止，与启动方式无关）
+    for a in (aggs or []):
+        key = a.get("key", "")
+        if not key:
+            continue
+        try:
+            _push(key, {
+                "service_name": a.get("service_name", ""),
+                "version": a.get("version", ""),
+                "proc_name": a.get("proc_name", ""),
+                "running": a.get("running", False),
+                "pids": a.get("pids", []),
+                "process_count": a.get("process_count", 0),
+                "timestamp": a.get("timestamp", ""),
+            })
+        except Exception as e:
+            failed += 1
+            errors.append(f"{key}: {e}")
+            logging.warning("[upload_to_redis] 聚合状态上传失败: %s -> %s", key, e)
 
     return {
         "success": failed == 0,
@@ -414,14 +678,15 @@ def collect_and_upload(expire: int = 600) -> Dict[str, Any]:
     返回:
         {"success": true, "processes": [...], "upload": {...}}
     """
-    processes = collect_all_processes()
-    upload_result = upload_to_redis(processes, expire=expire)
+    processes, aggs = collect_all_with_agg()
+    upload_result = upload_to_redis(processes, expire=expire, aggs=aggs)
     # 上传后立即同步到 resources.txt
     sync_result = sync_redis_to_resources(expire=expire)
     return {
         "success": upload_result["success"] and sync_result["success"],
         "process_count": len(processes),
         "processes": processes,
+        "aggs": aggs,
         "upload": upload_result,
         "sync": sync_result,
     }

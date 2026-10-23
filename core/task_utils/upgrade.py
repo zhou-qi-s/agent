@@ -33,6 +33,8 @@ from utils.app_path import (
     refresh_state_pids,
     link_to_current,
     list_cache_versions,
+    resolve_bin_dir,
+    build_script_env,
 )
 from utils.config_loader import load_config
 from core.task_utils.install import install_task
@@ -182,13 +184,23 @@ def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> boo
             return False
 
 
-def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, Any]:
-    """执行脚本，返回 {success, exit_code, stdout, stderr}"""
+def _execute_script(script_path: str, bin_dir: str, timeout: int,
+                    env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """执行脚本，返回 {success, exit_code, stdout, stderr}
+
+    env: 传给脚本的额外环境变量（INSTALL_PATH / AGENT_STATE_DIR 等）。
+    """
     try:
+        if env:
+            merged_env = os.environ.copy()
+            merged_env.update({str(k): str(v) for k, v in env.items()})
+        else:
+            merged_env = None
         if os.name == "nt":
             proc = subprocess.run(
                 [script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 timeout=timeout,
                 capture_output=True,
                 text=True,
@@ -198,6 +210,7 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
             proc = subprocess.run(
                 ["bash", script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 timeout=timeout,
                 capture_output=True,
                 text=True,
@@ -430,9 +443,10 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
         pid_before = ",".join(str(p) for p in alive_pids)
 
         if alive_pids:
-            # 执行运行区的 bin/stop.sh（经 current/bin 软链接）
+            # 执行停止脚本：优先按安装回执的实际安装位置（{install_path}/bin），
+            # 没有回执回落运行区 bin/（指向 current/bin 的软链接）
             ext = ".bat" if os.name == "nt" else ".sh"
-            bin_dir = os.path.join(component_dir, "bin")
+            bin_dir = resolve_bin_dir(service_name, os.path.join(component_dir, "bin"))
             stop_script = os.path.join(bin_dir, f"stop{ext}")
 
             if not os.path.isfile(stop_script):
@@ -448,7 +462,8 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
                 )
 
             logging.info("[upgrade_task] 执行停止脚本: %s", stop_script)
-            stop_exec = _execute_script(stop_script, bin_dir, min(timeout, 60))
+            stop_exec = _execute_script(stop_script, bin_dir, min(timeout, 60),
+                                        env=build_script_env(service_name, current_version))
             logging.info(
                 "[upgrade_task] 停止脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
                 stop_exec["exit_code"], stop_exec.get("stdout", ""), stop_exec.get("stderr", ""),
@@ -570,6 +585,8 @@ def upgrade_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
         "new_version": new_version,
         "component_dir": component_dir,
         "pid": start_data.get("pid", ""),
+        # 升级会重跑 install.sh，实际安装位置可能变化；随回报带给平台刷新实例 INSTALL_PATH
+        "work_dir": install_result.get("data", {}).get("work_dir", ""),
         "steps": steps,
     })
 

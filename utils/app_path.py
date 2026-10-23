@@ -1095,3 +1095,187 @@ def verify_links(app_name: str, sub_dir: str = "") -> List[str]:
         if os.path.islink(link_path) and not os.path.exists(link_path):
             broken.append(link_path)
     return broken
+
+
+# =============================================================================
+# 安装回执（manifest）
+# =============================================================================
+#
+# 背景：应用不一定安装在运行区。包的 install.sh 可以把应用本体装到任意目录
+# （用户在建实例时填的「文件夹位置」，经平台 install_path 参数下发），
+# 运行区只保留 Agent 的记账文件（state/）。
+#
+# Agent 通过环境变量把两个关键位置告知脚本：
+#   INSTALL_PATH     应用实际安装位置（未指定时 = 运行区组件目录，行为与旧版一致）
+#   AGENT_STATE_DIR  Agent 状态目录（{apps}/.../{app}/state）
+#                     脚本把启动 pid 写到 $AGENT_STATE_DIR/pid（原约定不变），
+#                     安装完成后把回执写到 $AGENT_STATE_DIR/manifest.yaml
+#
+# 回执（YAML，键均可选，脚本按需写）：
+#   install_path     实际安装位置（脚本可能对 INSTALL_PATH 做过归一化，以回执为准）
+#   start_script / stop_script / uninstall_script   各脚本入口绝对路径
+#   version          本次安装的版本号
+#
+# Agent 把回执并入 state/config.yaml 的 manifest 字段；start/stop/uninstall
+# 优先用 manifest 定位脚本目录，没有回执则回落运行区软链接结构（兼容旧包）。
+MANIFEST_FILE_NAME = "manifest.yaml"
+
+
+def get_manifest_file(app_name: str, sub_dir: str = "") -> Optional[str]:
+    """
+    获取安装回执文件路径：{apps}/[{sub_dir}/]{app_name}/state/manifest.yaml
+
+    参数:
+        app_name: 应用名称
+
+    返回:
+        文件绝对路径；apps 未配置或 app_name 为空返回 None
+    """
+    state_dir = get_state_dir(app_name, sub_dir)
+    return os.path.join(state_dir, MANIFEST_FILE_NAME) if state_dir else None
+
+
+def read_manifest_file(app_name: str, sub_dir: str = "") -> Dict[str, Any]:
+    """
+    读取脚本写出的安装回执文件（state/manifest.yaml）。
+
+    参数:
+        app_name: 应用名称
+
+    返回:
+        回执字典；文件不存在或解析失败返回空 dict
+    """
+    manifest_file = get_manifest_file(app_name, sub_dir)
+    if not manifest_file or not os.path.isfile(manifest_file):
+        return {}
+
+    try:
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.warning("[路径] 读取安装回执失败: %s -> %s", manifest_file, e)
+        return {}
+
+
+def clear_manifest_file(app_name: str, sub_dir: str = "") -> bool:
+    """
+    删除安装回执文件（state/manifest.yaml）。
+
+    在执行 install.sh 之前调用：保证安装后读到的回执一定是【本次】脚本写出的，
+    否则上一次安装的残留回执会被误当成新回执，把位置记错。
+
+    参数:
+        app_name: 应用名称
+
+    返回:
+        是否执行了删除
+    """
+    manifest_file = get_manifest_file(app_name, sub_dir)
+    if not manifest_file or not os.path.exists(manifest_file):
+        return False
+    try:
+        os.remove(manifest_file)
+        logging.info("[路径] 已清除旧安装回执: %s", manifest_file)
+        return True
+    except OSError as e:
+        logging.warning("[路径] 删除旧安装回执失败: %s -> %s", manifest_file, e)
+        return False
+
+
+def get_manifest(app_name: str, sub_dir: str = "") -> Dict[str, Any]:
+    """
+    读取 state/config.yaml 里记录的安装回执（manifest 字段）。
+
+    参数:
+        app_name: 应用名称
+
+    返回:
+        回执字典；未记录或格式不对返回空 dict
+    """
+    state = read_state(app_name, sub_dir)
+    manifest = state.get("manifest")
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def get_manifest_install_path(app_name: str, sub_dir: str = "") -> str:
+    """
+    获取应用的实际安装位置。
+
+    优先级：state.manifest.install_path > 运行区组件目录（旧包兼容，返回 "" 由调用方兜底）。
+    """
+    manifest = get_manifest(app_name, sub_dir)
+    path = str(manifest.get("install_path", "") or "").strip()
+    return path
+
+
+def resolve_bin_dir(app_name: str,
+                    fallback_bin_dir: str,
+                    sub_dir: str = "",
+                    manifest: Optional[Dict[str, Any]] = None) -> str:
+    """
+    定位脚本目录（bin）：优先回执记录的实际安装位置，否则回落运行区。
+
+    参数:
+        app_name:         应用名称（仅用于日志）
+        fallback_bin_dir: 运行区 bin 目录（{apps}/.../{app}/bin，旧包走这里）
+        sub_dir:          类别子目录
+        manifest:         已读出的回执；不传则自动读 state
+
+    返回:
+        存在的 bin 目录绝对路径；回执位置不存在时回落 fallback_bin_dir
+    """
+    if manifest is None:
+        manifest = get_manifest(app_name, sub_dir)
+    install_path = str(manifest.get("install_path", "") or "").strip()
+    if install_path:
+        candidate = os.path.join(install_path, "bin")
+        if os.path.isdir(candidate):
+            if os.path.abspath(candidate) != os.path.abspath(fallback_bin_dir):
+                logging.info("[路径] 按安装回执定位脚本目录: %s", candidate)
+            return candidate
+        logging.warning("[路径] 安装回执的 bin 目录不存在: %s，回落运行区", candidate)
+    return fallback_bin_dir
+
+
+def build_script_env(app_name: str,
+                     version: str = "",
+                     sub_dir: str = "",
+                     install_path: str = "") -> Dict[str, str]:
+    """
+    组装传给包脚本（install/start/stop/uninstall.sh）的公共环境变量。
+
+    变量:
+        APP_NAME         应用名
+        VERSION          本次任务的目标版本号
+        INSTALL_PATH     应用实际安装位置：
+                         显式 install_path > 已有回执记录 > 运行区组件目录（默认行为）
+        AGENT_STATE_DIR  Agent 状态目录（脚本写 pid / 安装回执的目标位置）
+
+    参数:
+        app_name:     应用名称
+        version:      版本号（可空）
+        sub_dir:      类别子目录
+        install_path: 显式指定的安装位置（安装任务下发；可空）
+
+    返回:
+        环境变量字典（调用方再与进程环境合并后传给脚本）
+    """
+    env: Dict[str, str] = {"APP_NAME": app_name or ""}
+    if version:
+        env["VERSION"] = version
+
+    state_dir = get_state_dir(app_name, sub_dir) or ""
+    if state_dir:
+        env["AGENT_STATE_DIR"] = state_dir
+
+    target = (install_path or "").strip()
+    if not target:
+        target = get_manifest_install_path(app_name, sub_dir)
+    if not target:
+        app_dir = find_apps_component_dir(app_name, sub_dir)
+        target = app_dir or ""
+    if target:
+        env["INSTALL_PATH"] = target
+
+    return env

@@ -25,6 +25,7 @@ Nacos心跳管理：
 import json
 import logging
 import subprocess
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -33,6 +34,7 @@ from typing import Any, cast
 import requests
 
 import utils.util
+from core.executor.shell import Shell
 from core.task_utils.rollback import rollback_task
 from core.utils import normalize_task_result
 from utils.config_loader import load_config
@@ -214,6 +216,28 @@ TASK_TYPE_REQUIREMENT = {
 }
 
 
+def kill_script_task(parameters, retry=0, timeout=30):
+    """
+    控制类任务：强制结束某个「挂起中」任务的脚本（平台「强制结束」按钮下发）。
+
+    与业务任务的本质区别：
+        · 它不是业务动作，**不上报 task_report**（平台侧也不建任务记录，
+          否则任务表里会多出一条没有意义的管理记录）；
+        · 被杀脚本的终态由原任务的观察线程补报（失败），任务状态照常闭环。
+
+    参数:
+        parameters: 必须包含 target_task_id（要结束的原任务 ID）
+    """
+    target = str(parameters.get("target_task_id") or "").strip()
+    if not target:
+        return False, {"error_type": "BadParameter", "error_message": "缺少 target_task_id"}
+
+    info = Shell.kill_hanging(target, reason="平台强制结束")
+    logging.warning("[任务管理] 强制结束挂起脚本: target=%s found=%s killed=%s",
+                    target, info.get("found"), info.get("killed"))
+    return bool(info.get("found")), info
+
+
 # 任务处理器注册表：任务类型 -> 处理函数
 TASK_HANDLERS = {
     "download": download_task,
@@ -240,7 +264,8 @@ TASK_HANDLERS = {
     "rollback": rollback_task,
     "container_start": container_start_task,
     "container_stop": container_stop_task,
-    "container_restart": container_restart_task
+    "container_restart": container_restart_task,
+    "kill_script": kill_script_task,
 }
 
 
@@ -314,11 +339,27 @@ def handle_task(task, enabled_types=None):
             logging.warning(f"[任务管理] timeout 参数无效，使用默认值 10000: {raw_timeout}")
             timeout = 10000
 
+        # ★单位归一化：平台下发的是**毫秒**（如 90000），Agent 内部按**秒**使用。
+        # 不换算会把脚本超时放大 1000 倍（90000 秒 ≈ 25 小时），后果是：
+        # 脚本写错/挂住时任务线程一直阻塞在 communicate()，既不进入「挂起观察」，
+        # 也消费不到后续任务（包括平台的「强制结束」指令）。
+        # 约定：> 3600 的值一律按毫秒换算；正常的秒级超时（≤3600）不受影响。
+        if timeout > 3600:
+            timeout = max(1, timeout // 1000)
+
         created_at = task.get('created_at', datetime.now())
         agent_ip = utils.util.get_ip() or "unknown"
 
         logging.info(
             f"[任务管理] 开始处理任务: {task_id}, 类型: {task_type}, 重试: {retry}, 超时: {timeout}秒, 创建时间: {created_at}")
+
+        # ── 控制类任务：强制结束挂起脚本 ──
+        # 静默执行、不上报（平台不建任务记录）；被杀脚本的终态由原任务观察线程补报。
+        if task_type == "kill_script":
+            ok, info = kill_script_task(parameters, retry=retry, timeout=timeout)
+            logging.warning("[任务管理] 控制指令 kill_script 执行完毕: ok=%s target=%s",
+                            ok, parameters.get("target_task_id"))
+            return {"control": True, "ok": ok, "detail": info}
 
         # 查找任务处理器
         handler = TASK_HANDLERS.get(task_type)
@@ -338,6 +379,72 @@ def handle_task(task, enabled_types=None):
             }
         else:
             result = normalize_task_result(handler(parameters, retry=retry, timeout=timeout), task_id, task_type, agent_ip)
+
+        # ── 挂起脚本处理（信任脚本模式）──
+        # install/start 等脚本可能在前台常驻（脚本不退出 = 应用在跑）。
+        # Shell 层超时不杀，只登记挂起；这里把任务标记为「执行中」上报，
+        # 并起观察线程等脚本真正退出后再补报终态（成功/失败）。
+        hanging = Shell.pop_hanging(task_id)
+        if hanging:
+            proc = hanging["popen"]
+            elapsed_start = hanging.get("started", 0)
+            # ★放回登记表：观察期间平台可以按 task_id 下发「强制结束」，
+            # 观察线程补报终态后再清理（见 _watch_hanging_script 末尾 drop_hanging）。
+            Shell.restore_hanging(task_id, hanging)
+            result["result"] = 2  # 2 = 执行中（平台 resolveTaskStatus 据此置 PENDING）
+            result["message"] = (result.get("message") or "") + "（脚本仍在执行中，已转后台观察）"
+            # ★挂起时不能带实例状态码：平台 taskReport 会照抄 payload 的 status 写实例，
+            # 带着会把手头任务的成功/失败码（如 8/9）提前写进实例。挂起期间实例状态不动，
+            # 等 watcher 补报终态时再更新。
+            result.pop("status", None)
+            result.setdefault("data", {})
+            result["data"]["script_still_running"] = True
+            result["data"]["script_path"] = hanging.get("script_path", "")
+            result["data"]["script_started_at"] = elapsed_start
+
+            max_hang = int(hanging.get("max_hang") or 1800)
+
+            def _watch_hanging_script():
+                """等挂起脚本真正退出，补报终态（平台外启动/脚本自治不在此列——只补报本任务）"""
+                out = err = ""
+                timeout_hit = False
+                try:
+                    try:
+                        out, err = proc.communicate(timeout=max_hang)
+                    except subprocess.TimeoutExpired:
+                        # ★挂起上限兜底：脚本写错（死循环/卡住）不能永远挂着
+                        timeout_hit = True
+                        Shell.kill_hanging(task_id, reason=f"挂起超过上限 {max_hang}s，自动结束")
+                        try:
+                            out, err = proc.communicate(timeout=10)
+                        except Exception:
+                            pass
+                    code = proc.returncode
+                    ok = (code == 0) and not timeout_hit
+                    final = dict(result)
+                    final["result"] = 1 if ok else 0
+                    if timeout_hit:
+                        final["message"] = f"脚本挂起超过 {max_hang}s 上限，已自动强制结束"
+                    else:
+                        final["message"] = (
+                            f"挂起脚本执行完成（{int(time.time() - elapsed_start)}s）: "
+                            + ("成功" if ok else f"退出码 {code}")
+                        )
+                    final["data"] = dict(result.get("data") or {})
+                    final["data"]["script_still_running"] = False
+                    final["data"]["hang_timeout"] = timeout_hit
+                    final["data"]["stdout"] = (out or "").strip()
+                    final["data"]["stderr"] = (err or "").strip()
+                    final["data"]["exit_code"] = code
+                    upload_task_result(final)
+                    logging.info(f"[任务管理] 挂起脚本终态已补报: {task_id} code={code} timeout={timeout_hit}")
+                except Exception as e:
+                    logging.error(f"[任务管理] 挂起脚本观察异常: {task_id} -> {e}")
+                finally:
+                    Shell.drop_hanging(task_id)
+
+            threading.Thread(target=_watch_hanging_script, daemon=True).start()
+            logging.info(f"[任务管理] 任务 {task_id} 脚本挂起执行中，观察线程已启动")
 
         # 上报结果
         upload_task_result(result)

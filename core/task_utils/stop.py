@@ -21,6 +21,8 @@ from utils.app_path import (
     read_state_pids,
     refresh_state_pids,
     get_pid_file,
+    resolve_bin_dir,
+    build_script_env,
 )
 from utils.config_loader import load_config
 
@@ -110,8 +112,10 @@ def _resolve_paths(service_name: str) -> tuple:
             "", "", "",
         )
 
-    # bin 目录：{apps}/{service_name}/bin（指向 current/bin 的软链接）
-    bin_dir = os.path.join(component_dir, "bin")
+    # bin 目录：优先按安装回执的实际安装位置（{install_path}/bin），
+    # 没有回执或位置不存在时回落 {apps}/{service_name}/bin（指向 current/bin 的软链接）。
+    fallback_bin = os.path.join(component_dir, "bin")
+    bin_dir = resolve_bin_dir(service_name, fallback_bin)
 
     return None, component_dir, version, bin_dir
 
@@ -216,16 +220,25 @@ def _process_exists(pid: int, expected_start_ticks: Optional[int] = None) -> boo
             return False
 
 
-def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, Any]:
+def _execute_script(script_path: str, bin_dir: str, timeout: int,
+                    env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """执行停止脚本，返回执行结果。
+
+    env: 传给脚本的额外环境变量（INSTALL_PATH / AGENT_STATE_DIR 等）。
 
     返回字段: success, exit_code, stdout, stderr
     """
     try:
+        if env:
+            merged_env = os.environ.copy()
+            merged_env.update({str(k): str(v) for k, v in env.items()})
+        else:
+            merged_env = None
         if os.name == "nt":
             proc = subprocess.run(
                 [script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 timeout=timeout,
                 capture_output=True,
                 text=True,
@@ -235,6 +248,7 @@ def _execute_script(script_path: str, bin_dir: str, timeout: int) -> Dict[str, A
             proc = subprocess.run(
                 ["bash", script_path],
                 cwd=bin_dir,
+                env=merged_env,
                 timeout=timeout,
                 capture_output=True,
                 text=True,
@@ -340,8 +354,10 @@ def stop_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300) ->
     }
 
     # ── 执行停止脚本 ──
+    # 环境变量告知脚本实际安装位置（INSTALL_PATH）与状态目录（AGENT_STATE_DIR）
+    script_env = build_script_env(service_name, version)
     exec_timeout = min(timeout, 60)
-    exec_result = _execute_script(script_path, bin_dir, exec_timeout)
+    exec_result = _execute_script(script_path, bin_dir, exec_timeout, env=script_env)
     logging.info(
         "[stop_task] 脚本执行完成, exit_code=%s, stdout=%s, stderr=%s",
         exec_result["exit_code"], exec_result.get("stdout", ""), exec_result.get("stderr", ""),
