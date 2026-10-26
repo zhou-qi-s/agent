@@ -37,6 +37,7 @@ interface:
   register: /api/agent/register #注册
   task_report: /api/agent/task_report #任务结果上报
   alarm: /api/agent/alarm #告警上报
+  tcp_snapshot: /api/agent/tcp/snapshot #TCP连接快照上报（服务上下游关系用）
   # nacos注册接口
   registerUrl: /api/component/register
   # nacos注销接口
@@ -68,6 +69,10 @@ agent:
     interval: 5    # 心跳间隔秒
   process:
     upload: 10 #进程信息上传间隔
+
+  tcp_collect:
+    enabled: true   # 采集本机 TCP 连接（供平台分析服务上下游调用关系）
+    interval: 15    # 采集/上报间隔秒
 
 upload_interval: 10 # 上报间隔秒
 package:

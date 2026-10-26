@@ -163,6 +163,23 @@ def main():
         )
         host_resource_thread.start()
 
+        # ========== TCP 连接快照线程（服务上下游调用关系的数据源） ==========
+        # Nacos 只有注册表、没有调用关系，这里把本机 ESTABLISHED 连接上报给平台，
+        # 平台再按 ip:port 对回服务名。采集失败不影响主流程。
+        try:
+            _tcp_cfg = ((_cfg.get("agent") or {}).get("tcp_collect") or {})
+            if _tcp_cfg.get("enabled", True):
+                from core.net.tcp_snapshot import tcp_snapshot_loop
+                _tcp_iv = int(_tcp_cfg.get("interval", 15) or 15)
+                tcp_thread = threading.Thread(
+                    target=tcp_snapshot_loop, kwargs={"interval": _tcp_iv},
+                    name="TcpSnapshot", daemon=True
+                )
+                tcp_thread.start()
+                logger.info(f"启动 TCP 连接快照线程，间隔 {_tcp_iv} 秒")
+        except Exception as e:
+            logger.warning(f"TCP 连接快照线程启动失败: {e}")
+
         # ========== 读取任务开关类型（仅支持复合类型） ==========
         _types_raw = (_cfg.get("server", {}) or {}).get("type", "") or ""
         _ENABLED_TYPES = set(t.strip().upper() for t in _types_raw.split(",") if t.strip())
