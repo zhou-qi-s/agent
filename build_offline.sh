@@ -46,6 +46,20 @@ mkdir -p "$RELEASE_DIR"
 export CLCACHE_DISABLE=1
 
 echo "[INFO] 开始 Nuitka 打包..."
+
+# 可选数据文件：仓库里没有 kubeconfig.yaml（凭据不入库），缺失时不能让 Nuitka FATAL
+EXTRA_DATA_ARGS=()
+if [[ -f kubeconfig.yaml ]]; then
+  EXTRA_DATA_ARGS+=(--include-data-file=kubeconfig.yaml=kubeconfig.yaml)
+else
+  echo "[WARN] 未找到 kubeconfig.yaml，跳过内置（节点上自行放置）"
+fi
+if [[ -f core/remove-k8s.sh ]]; then
+  EXTRA_DATA_ARGS+=(--include-data-file=core/remove-k8s.sh=core/remove-k8s.sh)
+else
+  echo "[WARN] 未找到 core/remove-k8s.sh，跳过内置"
+fi
+
 "$PYTHON_BIN" -m nuitka \
   --standalone \
   --assume-yes-for-downloads \
@@ -63,8 +77,7 @@ echo "[INFO] 开始 Nuitka 打包..."
   --include-package=core \
   --include-package=utils \
   --include-data-file=config.yaml=config.yaml \
-  --include-data-file=kubeconfig.yaml=kubeconfig.yaml \
-  --include-data-file=core/remove-k8s.sh=core/remove-k8s.sh \
+  "${EXTRA_DATA_ARGS[@]}" \
   --output-dir="$OUTPUT_DIR" \
   --remove-output \
   main.py
