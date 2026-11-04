@@ -14,17 +14,6 @@ name: Build Agent (ARM64 + AMD64)
 #      "Invalid workflow file"，一个 job 都不起）。所以 arm64 / amd64 保持两个独立 job。
 
 on:
-  # ★ 临时（2026-11-04）：本机没有 API 令牌，用 push 触发跑一次 arm64 打包，
-  #   跑完即恢复成只有 workflow_dispatch。
-  push:
-    branches: [main]
-    paths:
-      - "core/**"
-      - "utils/**"
-      - "api/**"
-      - "main.py"
-      - "build_offline.sh"
-      - ".github/workflows/build.yml"
   workflow_dispatch:
     inputs:
       build_arch:
@@ -40,7 +29,7 @@ on:
 jobs:
   build-arm64:
     name: Build ARM64
-    if: ${{ github.event_name == 'push' || github.event.inputs.build_arch == 'both' || github.event.inputs.build_arch == 'arm64' }}
+    if: ${{ github.event.inputs.build_arch == 'both' || github.event.inputs.build_arch == 'arm64' }}
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
