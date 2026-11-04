@@ -37,6 +37,7 @@ import utils.util
 from core.executor.shell import Shell
 from core.task_utils.rollback import rollback_task
 from core.utils import normalize_task_result
+from utils.agent_sign import sign_headers
 from utils.config_loader import load_config
 from utils.redis_store import RedisStore
 from core.task_utils.download import download_task
@@ -119,8 +120,11 @@ def read_task(timeout=0):
 
     except json.JSONDecodeError as e:
         logging.error(f"[任务管理] JSON解析失败: {e}")
-    except Exception as e:
-        logging.error(f"[任务管理] 读取任务异常: {e}")
+    except Exception:
+        # 连接类异常不在这里吞掉：原来打一行日志就 return None，
+        # 外层 while 拿到 None 会立刻再读，Redis 断连时一秒刷几千行日志
+        # （现场出现过 47 小时写满 6.1G）。交给 task_loop 统一退避。
+        raise
 
     return None
 
@@ -142,7 +146,7 @@ def upload_task_result(result):
         payload = dict(result)
         payload['timestamp'] = datetime.now().isoformat()
 
-        response = requests.post(upload_url, json=payload, timeout=30)
+        response = requests.post(upload_url, json=payload, timeout=30, headers=sign_headers(upload_url))
 
         if response.status_code == 200:
             logging.info(f"[任务管理] 任务结果上传成功: {payload.get('task_type', 'unknown')}")
@@ -482,6 +486,8 @@ def task_loop(timeout=0, enabled_types=None):
     """
     logging.info(f"[任务管理] 任务线程启动，阻塞超时: {timeout}秒, 启用的类型: {enabled_types}")
 
+    fail_count = 0
+
     while True:
         try:
             # 阻塞读取任务
@@ -489,8 +495,15 @@ def task_loop(timeout=0, enabled_types=None):
 
             # 处理任务
             if task:
+                if fail_count:
+                    logging.info(f"[任务管理] Redis 读取已恢复正常（之前连续失败 {fail_count} 次）")
+                fail_count = 0
                 handle_task(task, enabled_types=enabled_types)
 
         except Exception as e:
-            logging.error(f"[任务管理] 任务循环异常: {e}")
-            time.sleep(3)
+            fail_count += 1
+            # 断连时不要每轮都打：前 3 次逐条打，之后每 60 次打一条
+            if fail_count <= 3 or fail_count % 60 == 0:
+                logging.error(f"[任务管理] 读取任务失败(连续 {fail_count} 次): {type(e).__name__}: {e}")
+            # 指数退避 1/2/4/8 秒，封顶 10 秒，避免空转把日志刷爆
+            time.sleep(min(10, 2 ** min(fail_count - 1, 4)))

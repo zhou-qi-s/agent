@@ -14,6 +14,7 @@ import zipfile
 
 import requests
 
+from utils.agent_sign import sign_headers
 from utils.config_loader import load_config
 from utils.redis_client import get_redis
 
@@ -259,7 +260,8 @@ def report_task_log(task_id: str, line: str):
         requests.post(
             url,
             json=payload,
-            timeout=5
+            timeout=5,
+            headers=sign_headers(url)
         )
 
     except Exception as e:
@@ -1047,7 +1049,8 @@ def report_k8s_result(
         response = requests.post(
             url,
             json=payload,
-            timeout=10
+            timeout=10,
+            headers=sign_headers(url)
         )
 
         logging.info(

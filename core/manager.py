@@ -7,6 +7,7 @@ import requests
 
 import utils.util
 from utils.config_loader import load_config
+from utils.agent_sign import sign_headers
 from utils.logger import logger
 from utils.redis_store import RedisStore
 
@@ -44,7 +45,7 @@ def get_processes():
             "ip": ip
         }
         try:
-            resp = requests.post(PROCESS_URL, json=parameter, timeout=5)
+            resp = requests.post(PROCESS_URL, json=parameter, timeout=5, headers=sign_headers(PROCESS_URL))
             if resp.status_code != 200:
                 logging.warning(f"Process list request failed: {resp.status_code}")
                 return None
@@ -64,12 +65,12 @@ def update_process_list():
             "username": utils.util.username,
             "ip": utils.util.get_ip()
         }
-        resp = requests.post(VERSION_URL, json=parameter, timeout=5)
+        resp = requests.post(VERSION_URL, json=parameter, timeout=5, headers=sign_headers(VERSION_URL))
         if resp.status_code == 200:
             new_version = int(resp.text)
             if new_version != version:
                 version = new_version
-                resp = requests.post(PROCESS_URL, json=parameter, timeout=5)
+                resp = requests.post(PROCESS_URL, json=parameter, timeout=5, headers=sign_headers(PROCESS_URL))
                 if resp.status_code == 200:
                     process_data = json.loads(resp.text)
     except Exception as e:

@@ -24,6 +24,7 @@ try:
 except ImportError:  # 理论上 requirements 里已有，兜底不影响 Agent 启动
     psutil = None
 
+from utils.agent_sign import sign_headers
 from utils.config_loader import load_config
 
 logger = logging.getLogger(__name__)
@@ -158,7 +159,7 @@ def report_once():
     }
     try:
         url = _build_url(cfg)
-        resp = requests.post(url, json=payload, timeout=REPORT_TIMEOUT)
+        resp = requests.post(url, json=payload, timeout=REPORT_TIMEOUT, headers=sign_headers(url))
         if resp.status_code != 200:
             logger.warning("[TCP-SNAPSHOT] 上报失败 HTTP %s", resp.status_code)
             return False

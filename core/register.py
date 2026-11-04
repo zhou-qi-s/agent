@@ -6,6 +6,7 @@ import uuid
 import requests
 
 from utils.config_loader import load_config
+from utils.agent_sign import sign_headers
 from utils.logger import logger
 from utils.util import get_ip
 
@@ -67,7 +68,7 @@ def register_agent():
         try:
             logger.info(f"第 {retry + 1} 次尝试注册 -> {REGISTER_URL}")
 
-            resp = requests.post(REGISTER_URL, json=data, timeout=5)
+            resp = requests.post(REGISTER_URL, json=data, timeout=5, headers=sign_headers(REGISTER_URL))
 
             # HTTP 成功
             if resp.status_code == 200:

@@ -1,6 +1,9 @@
 server:
   iP: http://192.168.0.3
   port: 30000
+  # 平台回调签名密钥（2026-11-04 安全整改）：必须与后端 config.agent.secret 一致
+  # 留空＝不签名；后端 warn 模式只记日志，strict 模式会 401
+  secret: "bontor-agent-2026"
   compartment: CPT-CMD-004
   type: GENERAL, DISPLAY_CONSOLE, PLUGIN, HARBOR, KUBERNETES, SOFTWARE_REPO, VIRTUAL_MACHINE, CONTAINER
   redis:

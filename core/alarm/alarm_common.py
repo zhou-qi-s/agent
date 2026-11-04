@@ -17,6 +17,7 @@ from typing import Dict
 
 import requests
 
+from utils.agent_sign import sign_headers
 from utils.config_loader import load_config
 from utils.logger import logger
 
@@ -101,7 +102,7 @@ def report_alarm(
             alarm_type, alarm_name, get_local_ip(), url,
         )
 
-        response = requests.post(url, json=payload, timeout=5)
+        response = requests.post(url, json=payload, timeout=5, headers=sign_headers(url))
         success = response.status_code == 200
 
         if success:
