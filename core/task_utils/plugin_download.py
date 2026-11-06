@@ -32,6 +32,11 @@ from core.task_utils.download import (
     reorganize_to_standard_layout,
     cleanup_dir,
     write_app_id,
+    # ★2026-10-29：格式识别/改名逻辑统一放在 download.py，三类应用共用
+    _detect_archive_kind,
+    _kind_from_suffix,
+    _keep_archive_as_named,
+    _read_head,
 )
 
 
@@ -518,10 +523,10 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
     返回:
         bool: 解压成功返回 True，否则返回 False
     """
-    lower = archive_path.lower()
+    kind = _detect_archive_kind(archive_path) or _kind_from_suffix(archive_path)
     try:
         os.makedirs(dest_dir, exist_ok=True)
-        if lower.endswith(".zip"):
+        if kind == "zip":
             import zipfile
             with zipfile.ZipFile(archive_path, "r") as zf:
                 for zinfo in zf.infolist():
@@ -531,22 +536,23 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
                     if fixed != zinfo.filename:
                         zinfo.filename = fixed
                     zf.extract(zinfo, dest_dir)
-        elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+        elif kind == "tar.gz":
             import tarfile
             with tarfile.open(archive_path, "r:gz") as tf:
                 tf.extractall(dest_dir)
-        elif lower.endswith(".tar.bz2") or lower.endswith(".tbz2"):
+        elif kind == "tar.bz2":
             import tarfile
             with tarfile.open(archive_path, "r:bz2") as tf:
                 tf.extractall(dest_dir)
-        elif lower.endswith(".tar"):
+        elif kind == "tar":
             import tarfile
             with tarfile.open(archive_path, "r:") as tf:
                 tf.extractall(dest_dir)
         else:
-            logging.warning("[插件下载] 不支持解压的压缩格式，跳过解压: %s", archive_path)
+            logging.warning("[插件下载] 无法识别的压缩格式，跳过解压: %s（文件头前16字节=%r）",
+                            archive_path, _read_head(archive_path, 16))
             return False
-        logging.info("[插件下载] 解压成功: %s -> %s", archive_path, dest_dir)
+        logging.info("[插件下载] 解压成功(%s): %s -> %s", kind or "-", archive_path, dest_dir)
         return True
     except Exception as e:
         logging.error("[插件下载] 解压失败: %s -> %s: %s", archive_path, dest_dir, e)
@@ -672,17 +678,14 @@ def plugin_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: in
                                       error_type="ExtractError",
                                       error_message="下载成功但解压失败，请检查压缩包格式")
 
-    # 解压成功即可删除压缩包
-    try:
-        os.remove(target_file_path)
-        logging.info("[插件下载] 已删除压缩包: %s", target_file_path)
-    except Exception as rm_err:
-        logging.warning("[插件下载] 删除压缩包失败: %s", rm_err)
+    # 压缩包先留着：归位后按 {应用名}.{后缀} 改名再删（后缀要等 app.yaml 解析出来才知道）
+    detected_kind = _detect_archive_kind(target_file_path) or _kind_from_suffix(target_file_path)
 
-    # ── 7. 从 app.yaml 读取权威的应用名与版本号 ──
+    # ── 7. 从 app.yaml 读取权威的应用名与版本号（以及压缩后缀）──
     meta = read_app_meta(extract_dir)
     meta_name = meta.get("name", "")
     meta_version = meta.get("version", "")
+    meta_suffix = meta.get("suffix", "")
     # 应用名与版本号一律以「平台下发参数」为准，不用 app.yaml 覆盖。
     # 原因：后续 install/start/stop/upgrade/uninstall 均用平台的应用名与版本号
     #       定位目录（见 InstanceServiceImpl 各任务均取 app.getAppName()），
@@ -715,10 +718,25 @@ def plugin_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: in
                                       error_type="ReorganizeError", error_message=str(e),
                                       tb=traceback.format_exc())
 
-    cleanup_dir(staging_dir)
+    # ★注意：这里先不能清理 staging —— 压缩包还在里面，等改名删除之后再清
 
     # ── 9. 下载成功：把平台下发的应用记录 ID 写入包内 config/app.yaml（键名 appId）──
     write_app_id(final_version_dir, params.get("app_id"))
+
+    # ── 10. 压缩包按 {应用名}.{后缀} 改名，然后删除（解压完成不留包）──
+    archive_suffix = meta_suffix or detected_kind
+    named_archive = _keep_archive_as_named(target_file_path, final_version_dir, final_name, archive_suffix)
+    if named_archive:
+        result['data']["archive_name"] = os.path.basename(named_archive)
+        result['data']["archive_suffix"] = archive_suffix
+    to_remove = named_archive or target_file_path
+    try:
+        os.remove(to_remove)
+        logging.info("[插件下载] 已删除压缩包: %s", os.path.basename(to_remove))
+    except Exception as e:
+        logging.warning("[插件下载] 删除压缩包失败 %s: %s", to_remove, e)
+
+    cleanup_dir(staging_dir)
 
     result['data']["status"] = "downloaded_and_extracted"
     result['data']["extracted_dir"] = final_version_dir

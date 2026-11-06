@@ -259,8 +259,8 @@ async def query_process_by_service(
     返回:
         进程名、PID、是否存活、CPU、内存、IO、端口等信息
     """
-    if not _APPS_BASE:
-        raise HTTPException(status_code=500, detail="config.yaml 中未配置 server.apps")
+    if not _APPS_BASE and not _DOWNLOAD_BASE:
+        raise HTTPException(status_code=500, detail="config.yaml 中未配置 server.apps / server.download")
 
     # 先按平台下发的 type 判定类别层；type 与目录不符（或未下发）时自动探测，
     # 避免显控台/插件服务被误判成"运行区服务目录不存在"
@@ -268,8 +268,62 @@ async def query_process_by_service(
     if sub_dir and not os.path.isdir(os.path.join(_APPS_BASE, sub_dir, service_name)):
         sub_dir = ""
     if not sub_dir:
-        sub_dir = resolve_sub_dir(service_name, roots=[_APPS_BASE])
+        sub_dir = resolve_sub_dir(service_name)
 
+    # ── 虚拟机应用（type=1）/ 显控台（type=3）：按包内 app.yaml 的 name 全机匹配 ──
+    # ★2026-11-05：现场只有缓存区，应用可能装在任意目录，甚至没有 state/pid。
+    #   判据只看「app.yaml 声明的 name 与节点进程名一致」，与安装位置、pid 文件无关。
+    #   ★显控台与虚拟机统一口径，不再依赖启动脚本写的 pid。
+    #   name 与真实进程名对不上属于应用包的问题（包脚本必须在启动时用同名进程）。
+    if sub_dir in ("", "displayConsole"):
+        from core.process.process_info import (
+            _resolve_version,
+            _read_proc_name,
+            _match_processes_by_name,
+        )
+        version = _resolve_version(service_name, sub_dir)
+        proc_name = _read_proc_name(service_name, version, sub_dir)
+        matched = _match_processes_by_name(proc_name)
+
+        all_pids = _collect_all_pids(matched)
+        io1_map, io2_map = _batch_io_sample(all_pids)
+
+        processes: list = []
+        seen_pids: set = set()
+        for pid in matched:
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            tree = _get_process_tree(pid, io1_map, io2_map)
+            if tree["parent"]:
+                processes.append(tree["parent"])
+            for child in tree["children"]:
+                if child["pid"] not in seen_pids:
+                    seen_pids.add(child["pid"])
+                    processes.append(child)
+
+        return {
+            "code": 200,
+            "message": "查询成功",
+            "ip": get_ip(),
+            "data": processes,
+            "summary": {
+                "total_processes": len(processes),
+                "total_cpu_percent": round(sum(p.get("cpu_percent", 0) or 0 for p in processes), 2),
+                "total_memory_rss_bytes": sum(p.get("memory_rss_bytes", 0) or 0 for p in processes),
+                "total_memory_vms_bytes": sum(p.get("memory_vms_bytes", 0) or 0 for p in processes),
+                "total_memory_percent": round(sum(p.get("memory_percent", 0) or 0 for p in processes), 2),
+                "total_threads": sum(p.get("num_threads", 0) or 0 for p in processes),
+                "total_io_read_bytes_per_sec": round(sum(p.get("io_read_bytes_per_sec", 0) or 0 for p in processes), 2),
+                "total_io_write_bytes_per_sec": round(sum(p.get("io_write_bytes_per_sec", 0) or 0 for p in processes), 2),
+            },
+            "service_name": service_name,
+            "version": version,
+            "proc_name": proc_name,
+            "query_time": datetime.now().isoformat(),
+        }
+
+    # ── 显控台 / 插件：仍按运行区 state 的 pid 查（各有自己的状态机制）──
     base_path = os.path.join(_APPS_BASE, sub_dir) if sub_dir else _APPS_BASE
     service_dir = os.path.join(base_path, service_name)
     if not os.path.isdir(service_dir):

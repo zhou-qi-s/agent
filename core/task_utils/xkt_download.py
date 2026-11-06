@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -528,9 +529,67 @@ def _restore_zip_permissions(zf: Any, dest_dir: str) -> None:
         logging.warning("[显控下载] 恢复 zip 文件权限异常: %s", e)
 
 
+def _read_head(path: str, n: int = 16) -> bytes:
+    """读文件头若干字节（仅用于日志里体现"到底是什么文件"）。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(n)
+    except Exception:
+        return b""
+
+
+def _detect_archive_kind(archive_path: str) -> str:
+    """
+    按【文件头】判断压缩格式，不依赖文件名后缀。
+
+    ★ 为什么不能只看后缀：软件仓库下载回来的文件常常没有后缀（平台下发的
+      file_suffix 是应用类型标识，如 XKT），按后缀判断必然走进"不支持解压"分支，
+      现场表现为「下载成功但解压失败」。
+
+    返回: zip / tar.gz / tar.bz2 / tar；识别不出返回空串
+    """
+    try:
+        with open(archive_path, "rb") as f:
+            head = f.read(512)
+    except Exception as e:
+        logging.warning("[显控下载] 读取文件头失败 %s: %s", archive_path, e)
+        return ""
+
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return "zip"
+    if head[:2] == b"\x1f\x8b":
+        return "tar.gz"
+    if head[:3] == b"BZh":
+        return "tar.bz2"
+    # tar 没有固定魔数，用 tarfile 探一次（只看文件头，开销很小）
+    try:
+        import tarfile
+        if tarfile.is_tarfile(archive_path):
+            return "tar"
+    except Exception:
+        pass
+    return ""
+
+
+def _kind_from_suffix(archive_path: str) -> str:
+    """按后缀兜底判断（文件头认不出时才用）。"""
+    lower = archive_path.lower()
+    if lower.endswith(".zip"):
+        return "zip"
+    if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+        return "tar.gz"
+    if lower.endswith(".tar.bz2") or lower.endswith(".tbz2"):
+        return "tar.bz2"
+    if lower.endswith(".tar"):
+        return "tar"
+    return ""
+
+
 def _extract_archive(archive_path: str, dest_dir: str) -> bool:
     """
     解压压缩包到目标目录。
+
+    ★ 格式判断优先看文件头（软件仓库下来的包通常没后缀），后缀只作兜底。
 
     参数:
         archive_path: 压缩包路径
@@ -539,35 +598,73 @@ def _extract_archive(archive_path: str, dest_dir: str) -> bool:
     返回:
         bool: 解压成功返回 True，否则返回 False
     """
-    lower = archive_path.lower()
+    kind = _detect_archive_kind(archive_path) or _kind_from_suffix(archive_path)
     try:
         os.makedirs(dest_dir, exist_ok=True)
-        if lower.endswith(".zip"):
+        if kind == "zip":
             import zipfile
             with zipfile.ZipFile(archive_path, "r") as zf:
                 zf.extractall(dest_dir)
                 # Python zipfile 不恢复 Unix 权限位，需手动恢复
                 _restore_zip_permissions(zf, dest_dir)
-        elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+        elif kind == "tar.gz":
             import tarfile
             with tarfile.open(archive_path, "r:gz") as tf:
                 tf.extractall(dest_dir)
-        elif lower.endswith(".tar.bz2") or lower.endswith(".tbz2"):
+        elif kind == "tar.bz2":
             import tarfile
             with tarfile.open(archive_path, "r:bz2") as tf:
                 tf.extractall(dest_dir)
-        elif lower.endswith(".tar"):
+        elif kind == "tar":
             import tarfile
             with tarfile.open(archive_path, "r:") as tf:
                 tf.extractall(dest_dir)
         else:
-            logging.warning("[显控下载] 不支持解压的压缩格式，跳过解压: %s", archive_path)
+            logging.warning("[显控下载] 无法识别的压缩格式，跳过解压: %s（文件头前16字节=%r）",
+                            archive_path, _read_head(archive_path, 16))
             return False
-        logging.info("[显控下载] 解压成功: %s -> %s", archive_path, dest_dir)
+        logging.info("[显控下载] 解压成功(%s): %s -> %s", kind or "-", archive_path, dest_dir)
         return True
     except Exception as e:
         logging.error("[显控下载] 解压失败: %s -> %s: %s", archive_path, dest_dir, e)
         return False
+
+
+def _keep_archive_as_named(archive_path: str, version_dir: str, name: str, suffix: str) -> str:
+    """
+    把下载的压缩包改名成 {应用名}.{后缀} 并保留到版本目录下。
+
+    ★ 后缀来源：优先取包内 config/app.yaml 的 suffix 字段（现场约定），
+      没写就用文件头识别出的真实格式（zip / tar.gz / ...）。
+      之所以要显式改名：软件仓库下载回来的文件没有后缀，人工和后续复用都认不出是什么包。
+
+    返回: 改名后的完整路径；失败返回空串
+    """
+    suffix = str(suffix or "").strip().lstrip(".")
+    name = str(name or "").strip()
+    try:
+        if not os.path.isdir(version_dir):
+            return ""
+        # 名字或后缀缺失时保留原文件名 —— 宁可留个没后缀的包，也不能把包丢了
+        if suffix and name:
+            target = os.path.join(version_dir, "%s.%s" % (name, suffix))
+        else:
+            target = os.path.join(version_dir, os.path.basename(archive_path))
+        if os.path.abspath(archive_path) == os.path.abspath(target):
+            return target
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+        shutil.move(archive_path, target)
+        logging.info("[显控下载] 压缩包已改为 %s 并保留在版本目录", os.path.basename(target))
+        return target
+    except Exception as e:
+        logging.warning("[显控下载] 压缩包改名失败 %s -> %s: %s", archive_path, version_dir, e)
+        return ""
+
+
 # 注：原 _strip_single_top_dir() 已删除。
 #     相关逻辑在新架构中已失效（详见 download.py 同类说明），且无调用方。
 
@@ -689,17 +786,15 @@ def xkt_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int =
                                       error_type="ExtractError",
                                       error_message="下载成功但解压失败，请检查压缩包格式")
 
-    # 解压成功即可删除压缩包
-    try:
-        os.remove(target_file_path)
-        logging.info("[显控下载] 已删除压缩包: %s", target_file_path)
-    except Exception as rm_err:
-        logging.warning("[显控下载] 删除压缩包失败: %s", rm_err)
+    # 压缩包先不删：归位后要用 app.yaml 的 suffix 把它改名为 {应用名}.{后缀} 保留下来
+    # （原来这里直接删包；现场要求下载完成后包名要能看出是什么格式）
+    detected_kind = _detect_archive_kind(target_file_path) or _kind_from_suffix(target_file_path)
 
-    # ── 7. 从 app.yaml 读取权威的应用名与版本号 ──
+    # ── 7. 从 app.yaml 读取权威的应用名与版本号（以及压缩后缀）──
     meta = read_app_meta(extract_dir)
     meta_name = meta.get("name", "")
     meta_version = meta.get("version", "")
+    meta_suffix = meta.get("suffix", "")
     # 应用名与版本号一律以「平台下发参数」为准，不用 app.yaml 覆盖。
     # 原因：后续 install/start/stop/upgrade/uninstall 均用平台的应用名与版本号
     #       定位目录（见 InstanceServiceImpl 各任务均取 app.getAppName()），
@@ -732,10 +827,28 @@ def xkt_download_task(parameters: Dict[str, Any], retry: int = 0, timeout: int =
                                       error_type="ReorganizeError", error_message=str(e),
                                       tb=traceback.format_exc())
 
-    cleanup_dir(staging_dir)
+    # ★注意：这里先不能清理 staging —— 压缩包还在里面，要等下面改名保留之后再清。
+    #   （原先在这里 cleanup，改名时文件已经没了，等于静默丢包）
 
     # ── 9. 下载成功：把平台下发的应用记录 ID 写入包内 config/app.yaml（键名 appId）──
     write_app_id(final_version_dir, params.get("app_id"))
+
+    # ── 10. 压缩包按 {应用名}.{后缀} 改名，然后删除（解压完成不留包）──
+    #   后缀优先取包内 app.yaml 的 suffix 字段；没写则用文件头识别出的真实格式。
+    #   改名是为了让包名/返回结果里能看出它到底是什么包，包本身解压完即回收。
+    archive_suffix = meta_suffix or detected_kind
+    named_archive = _keep_archive_as_named(target_file_path, final_version_dir, final_name, archive_suffix)
+    if named_archive:
+        result['data']["archive_name"] = os.path.basename(named_archive)
+        result['data']["archive_suffix"] = archive_suffix
+    to_remove = named_archive or target_file_path
+    try:
+        os.remove(to_remove)
+        logging.info("[显控下载] 已删除压缩包%s", ("（%s）" % os.path.basename(to_remove)) if to_remove else "")
+    except Exception as e:
+        logging.warning("[显控下载] 删除压缩包失败 %s: %s", to_remove, e)
+
+    cleanup_dir(staging_dir)
 
     result['data']["status"] = "downloaded_and_extracted"
     result['data']["extracted_dir"] = final_version_dir

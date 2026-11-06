@@ -1,6 +1,8 @@
 """
 系统管理相关的 API 路由
 """
+import os
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 from datetime import datetime
@@ -258,4 +260,71 @@ async def system_health_check():
             "timestamp": datetime.now().isoformat(),
             "checks": checks
         }
+    }
+
+
+def _tail_lines(path, n, block_size=8192):
+    """从文件末尾倒着读，避免把大日志整个读进内存"""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        data = b""
+        while pos > 0 and data.count(b"\n") <= n:
+            step = min(block_size, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+        return data.decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+@router.get("/log/tail")
+async def tail_agent_log(lines: int = 200, name: str = "agent"):
+    """
+    读取 Agent 运行日志的末尾若干行（平台节点卡片「查看日志」用）
+
+    :param lines: 返回行数，默认 200，上限 2000
+    :param name: 日志文件名（不含目录），默认 agent，对应 agent.log
+    """
+    from utils.logger import get_log_path
+
+    try:
+        lines = int(lines)
+    except (TypeError, ValueError):
+        lines = 200
+    lines = max(1, min(lines, 2000))
+
+    # 只允许读安装目录下的 .log，避免路径穿越
+    safe_name = os.path.basename(str(name or "agent")).strip()
+    if not safe_name or safe_name.startswith("."):
+        safe_name = "agent"
+    if not safe_name.endswith(".log"):
+        safe_name += ".log"
+
+    log_path = get_log_path(safe_name)
+    if not os.path.isfile(log_path):
+        return {
+            "code": 404,
+            "message": f"日志文件不存在: {log_path}",
+            "data": {"file": log_path, "lines": []},
+        }
+
+    try:
+        content = _tail_lines(log_path, lines)
+    except Exception as e:
+        return {
+            "code": 500,
+            "message": f"读取日志失败: {e}",
+            "data": {"file": log_path, "lines": []},
+        }
+
+    return {
+        "code": 200,
+        "message": "获取成功",
+        "data": {
+            "file": log_path,
+            "size": os.path.getsize(log_path),
+            "returned": len(content),
+            "lines": content,
+            "timestamp": datetime.now().isoformat(),
+        },
     }

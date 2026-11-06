@@ -81,8 +81,65 @@ def start_api_in_thread():
     return api_thread
 
 
+def _acquire_singleton_lock() -> bool:
+    """同一台机器只允许一个 Agent 实例（不论 root 还是普通账号启动）。
+
+    ★ 背景：同一 IP 被不同账号各起一个 Agent 时，两个进程抢同一个 FastAPI 端口、
+      抢同一份缓存/运行区，平台侧还会看到这台机器在账号间反复横跳（C 舱显示两个节点）。
+      抢不到端口的那个进程若不退出，守护脚本会每 10 秒拉起一个，几分钟堆出几十个进程。
+    实现：flock 排他锁 —— 锁随进程退出自动释放，不会像 pid 文件那样残留假 PID 导致误判。
+    锁文件放 /tmp，是为了让不同账号都能创建/打开它。
+    """
+    import os
+    import sys
+    try:
+        import fcntl
+    except ImportError:
+        return False  # Windows 等无 fcntl 的平台跳过
+
+    lock_path = os.environ.get("AGENT_LOCK_FILE", "/tmp/.agent_singleton.lock")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            os.chmod(lock_path, 0o666)
+        except Exception:
+            pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = ""
+            try:
+                with open(lock_path, "r") as f:
+                    holder = f.read().strip()
+            except Exception:
+                pass
+            logger.error("=" * 60)
+            logger.error("本机已有 Agent 在运行，本次启动退出（同一台机器只允许一个 Agent）")
+            if holder:
+                logger.error(f"  占用者: {holder}")
+            logger.error("  如确需换账号运行，请先停掉旧的：")
+            logger.error("    普通账号: ./stop_agent.sh")
+            logger.error("    旧进程属于 root 时: sudo pkill -x main.bin")
+            logger.error("=" * 60)
+            sys.exit(2)
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, ("pid=%s user=%s\n" % (
+                os.getpid(), os.environ.get("USER") or os.environ.get("LOGNAME") or os.getuid()
+            )).encode())
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.warning(f"单实例锁初始化失败（忽略，继续启动）: {e}")
+        return False
+
+
 def main():
     try:
+        # ★ 单实例：抢不到锁直接退出，避免同一台机器被不同账号拉出多个 Agent
+        _acquire_singleton_lock()
+
         logger.info("=" * 50)
         logger.info("Agent 系统启动中...")
         logger.info("=" * 50)

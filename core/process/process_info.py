@@ -26,6 +26,7 @@
 import json
 import logging
 import os
+import re
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,23 +127,112 @@ def _get_children_pids(pid: int) -> List[int]:
         return []
 
 
+def _cache_root(sub_dir: str = "") -> str:
+    """缓存区根目录（{download}[/{sub_dir}]）"""
+    return os.path.join(_DOWNLOAD_BASE, sub_dir) if sub_dir else _DOWNLOAD_BASE
+
+
+# 目录名尾部的版本号：t8proc.YYJCRJ.XNJ.1.0.1 → 尾部 .1.0.1
+_SERVICE_VERSION_SUFFIX = re.compile(r"[.\-_]v?\d+(?:[.\-_]\d+)*$")
+
+
+def _service_base_name(service_name: str) -> str:
+    """
+    把「缓存区目录名」还原成「应用名」。
+
+    ★2026-11-05（第八轮 D1）：下载时缓存区目录会带仓库记录版本号，
+    例如 t8proc.YYJCRJ.XNJ.1.0.1，而平台侧用的是应用名 t8proc.YYJCRJ.XNJ。
+    以前上报 Redis 的 key 和 /api/process/query 的入参都用目录名，
+    两边对不上 → 平台永远查不到进程、实例卡片永远"未运行"。
+
+    版本号只认「分隔符 + 纯数字」的尾巴，app2 这种以数字结尾的应用名不会被误剥。
+    """
+    if not service_name:
+        return service_name
+    base = _SERVICE_VERSION_SUFFIX.sub("", service_name).strip()
+    return base or service_name
+
+
+def _resolve_component_dir(service_name: str, sub_dir: str = "") -> str:
+    """
+    把「应用名」解析成缓存区里真实的组件目录（可能带版本后缀）。
+
+    先按精确名字找（t8proc.YYJCRJ.XNJ），找不到再找
+    t8proc.YYJCRJ.XNJ.<版本> 这类目录（多个取修改时间最新的）。
+
+    返回:
+        组件目录绝对路径；找不到返回空串
+    """
+    root = _cache_root(sub_dir)
+    direct = os.path.join(root, service_name)
+    if os.path.isdir(direct) and not os.path.islink(direct):
+        return direct
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return ""
+    prefix = service_name + "."
+    candidates: List[str] = []
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix):]
+        # 尾巴必须像版本号（1.0.1 / v2 / 3），避免命中 t8proc.YYJCRJ.XNJ-old 之类
+        if not re.match(r"^v?\d+(?:[.\-_]\d+)*$", rest):
+            continue
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            candidates.append(path)
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
+def _latest_cache_version(service_name: str, sub_dir: str = "") -> str:
+    """
+    缓存区里该应用「最新的可用版本目录」—— 目录下必须有 config/app.yaml。
+
+    ★只有缓存区、没有运行区（没有 current 软链、没有 state）的部署，
+    版本号只能从这里来。多个版本时取修改时间最新的那个。
+    """
+    component_dir = _resolve_component_dir(service_name, sub_dir)
+    if not component_dir:
+        return ""
+    try:
+        entries = os.listdir(component_dir)
+    except OSError:
+        return ""
+    best, best_mtime = "", -1.0
+    for name in entries:
+        version_dir = os.path.join(component_dir, name)
+        if os.path.islink(version_dir) or not os.path.isdir(version_dir):
+            continue
+        if not os.path.isfile(os.path.join(version_dir, "config", "app.yaml")):
+            continue
+        try:
+            mtime = os.path.getmtime(version_dir)
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = name, mtime
+    return best
+
+
 def _resolve_version(service_name: str, sub_dir: str = "") -> str:
     """
     解析服务当前生效的版本号（信任脚本模式的版本判定依据）。
 
-    优先解析运行区的 current 软链：{apps}[/{sub_dir}]/{服务名}/current
-        → 指向 {download}[/{sub_dir}]/{服务名}/{版本}
-        → 取链接目标 basename 即为版本号。
-
-    为什么不用 state.version：start 任务会把下发的 version 参数写回
-    state/config.yaml —— 如果 start 是按旧绑定（旧应用）发起的，
-    state.version 会被覆盖回旧值，巡检就会拿旧版本目录的 app.yaml
-    去匹配进程名。current 软链只反映 install 真正落地的版本，更可靠。
-
-    解析失败（软链不存在/损坏）时回退 state.version。
+    依次尝试：
+      1. 运行区 current 软链：{apps}[/{sub_dir}]/{服务名}/current
+         → 取链接目标 basename。它只反映 install 真正落地的版本，最可靠。
+      2. state/config.yaml 的 version（且缓存区里该版本目录真实存在）。
+         不能无条件信它：start 任务会把下发的 version 写回，旧绑定重放时会把它覆盖回旧值。
+      3. 缓存区里最新的版本目录（★2026-11-05：现场只有缓存区、没有运行区，
+         没有软链也没有 state 时靠这一条）。
 
     参数:
-        service_name: 服务名（运行区目录名）
+        service_name: 服务名（缓存区/运行区目录名）
         sub_dir:      应用类别层（"" / displayConsole / plugin）
 
     返回:
@@ -165,11 +255,16 @@ def _resolve_version(service_name: str, sub_dir: str = "") -> str:
     except OSError as e:
         logging.warning("[版本巡检] 解析 current 软链失败: %s -> %s", current_link, e)
 
-    # 回退：state.version
+    # 回退 1：state.version（要求缓存区里真的有这个版本目录）
     state = read_state(service_name, sub_dir)
     if state:
-        return str(state.get("version", "") or "").strip()
-    return ""
+        version = str(state.get("version", "") or "").strip()
+        component_dir = _resolve_component_dir(service_name, sub_dir)
+        if version and component_dir and os.path.isdir(os.path.join(component_dir, version)):
+            return version
+
+    # 回退 2：缓存区最新版本目录（只有缓存区的部署）
+    return _latest_cache_version(service_name, sub_dir)
 
 
 def _read_proc_name(service_name: str, version: str, sub_dir: str = "") -> str:
@@ -187,10 +282,11 @@ def _read_proc_name(service_name: str, version: str, sub_dir: str = "") -> str:
     返回:
         进程名
     """
-    base = _DOWNLOAD_BASE
-    if sub_dir:
-        base = os.path.join(base, sub_dir)
-    yaml_path = os.path.join(base, service_name, version, "config", "app.yaml")
+    # 组件目录可能带版本后缀（t8proc.YYJCRJ.XNJ.1.0.1），先解析出真实目录再拼版本路径
+    component_dir = _resolve_component_dir(service_name, sub_dir)
+    if not component_dir:
+        component_dir = os.path.join(_cache_root(sub_dir), service_name)
+    yaml_path = os.path.join(component_dir, version, "config", "app.yaml")
     if os.path.isfile(yaml_path):
         try:
             import yaml
@@ -302,15 +398,16 @@ def _collect_service_processes(
     """
     processes: List[Dict[str, Any]] = []
 
-    if sub_dir == "":
-        # ── 虚拟机应用：name 巡检（信任脚本模式）──
-        state = read_state(entry, sub_dir)
-        if not state:
-            return (entry, processes)
+    if sub_dir in ("", _XKT_SERVICE_ROOT):
+        # ── 虚拟机应用 / 显控台：name 巡检（信任脚本模式）──
+        # ★2026-11-05：不再要求运行区 state 存在 —— 现场只有缓存区，
+        #   应用装没装、在不在跑只看「缓存区有版本目录 + 全机按 app.yaml name 匹配到进程」。
+        #   ★显控台同步按 name 匹配：包内 app.yaml 的 name 与进程名一致就认，
+        #     不再依赖启动脚本写 pid（脚本不写 pid 的显控台包也能被监控到）。
         version = _resolve_version(entry, sub_dir)
         if not version:
             return (entry, processes)
-        proc_name = _read_proc_name(entry, version)
+        proc_name = _read_proc_name(entry, version, sub_dir)
         matched = _match_processes_by_name(proc_name)
         seen: set = set()
         for pid in matched:
@@ -369,51 +466,75 @@ def _collect_service_processes(
     return (entry, processes)
 
 
+def _scan_roots(base: str) -> List[Tuple[str, str]]:
+    """列出某个根目录下要扫的三层：本级 / displayConsole / plugin"""
+    if not base or not os.path.isdir(base):
+        return []
+    roots: List[Tuple[str, str]] = [(base, "")]
+    for sub_root in (_XKT_SERVICE_ROOT, _PLUGIN_SERVICE_ROOT):
+        path = os.path.join(base, sub_root)
+        if os.path.isdir(path):
+            roots.append((path, sub_root))
+    return roots
+
+
 def _iter_service_dirs() -> List[Tuple[str, str, str]]:
     """
-    收集所有需要采集的服务目录（**扫描运行区**）。
+    收集所有需要采集的服务（**缓存区 + 运行区，缓存区优先**）。
 
-    支持三种目录结构：
-        {apps}/{服务名}/state/config.yaml                    ← 虚拟机 / 通用服务
-        {apps}/displayConsole/{服务名}/state/config.yaml     ← 显控台服务
-        {apps}/plugin/{服务名}/state/config.yaml             ← 插件服务
+    ★2026-11-05：现场「只有缓存区、没有运行区」—— 应用直接放在
+    {download}[/{sub_dir}]/{服务名}/{版本}/ 下，没有 current 软链、
+    甚至没有 state/config.yaml。原实现只扫运行区并要求 state 存在，
+    这类部署会整个漏检，平台状态永远不更新。
 
-    有效服务判据：目录下存在 state/config.yaml（install 阶段写入）。
-    仅 runtime=true 的会在采集时被真正处理，此处只做目录筛选。
+    判据：
+        缓存区：{download}[/{sub_dir}]/{服务名}/ 下存在带 config/app.yaml 的版本目录
+        运行区：{apps}[/{sub_dir}]/{服务名}/state/config.yaml（旧结构，兼容保留）
 
     返回:
         [(service_dir, service_name, sub_dir), ...]
-        —— sub_dir 是应用类别层（"" / displayConsole / plugin），
-           调用方读取状态文件时必须一并传入，否则会按「一楼」去找而读不到。
     """
     tasks: List[Tuple[str, str, str]] = []
+    seen: set = set()
 
-    if not _APPS_BASE or not os.path.isdir(_APPS_BASE):
-        return tasks
+    def _add(service_dir: str, service_name: str, sub_dir: str):
+        key = (sub_dir, service_name)
+        if key in seen:
+            return
+        seen.add(key)
+        tasks.append((service_dir, service_name, sub_dir))
 
-    scan_roots: List[Tuple[str, str]] = [(_APPS_BASE, "")]
-    for sub_root in (_XKT_SERVICE_ROOT, _PLUGIN_SERVICE_ROOT):
-        root = os.path.join(_APPS_BASE, sub_root)
-        if os.path.isdir(root):
-            scan_roots.append((root, sub_root))
-
-    for root, sub_dir in scan_roots:
+    # ① 缓存区（现场主形态）
+    for root, sub_dir in _scan_roots(_DOWNLOAD_BASE):
         try:
             entries = os.listdir(root)
         except Exception as e:
-            logging.warning("[服务扫描] 读取目录失败: %s -> %s", root, e)
+            logging.warning("[服务扫描] 读取缓存区目录失败: %s -> %s", root, e)
             continue
+        for entry in entries:
+            component_dir = os.path.join(root, entry)
+            if os.path.islink(component_dir) or not os.path.isdir(component_dir):
+                continue
+            # ★上报用「应用名」而不是目录名：目录名带版本后缀（t8proc.YYJCRJ.XNJ.1.0.1），
+            #   平台用的是应用名（t8proc.YYJCRJ.XNJ），不归一化就永远对不上 key
+            base_name = _service_base_name(entry)
+            if _latest_cache_version(base_name, sub_dir):
+                _add(component_dir, base_name, sub_dir)
 
+    # ② 运行区（旧结构兼容）
+    for root, sub_dir in _scan_roots(_APPS_BASE):
+        try:
+            entries = os.listdir(root)
+        except Exception as e:
+            logging.warning("[服务扫描] 读取运行区目录失败: %s -> %s", root, e)
+            continue
         for entry in entries:
             service_dir = os.path.join(root, entry)
-            # 跳过软链接（运行区内的 current/app/bin/config 是链接，不是服务目录）
             if os.path.islink(service_dir) or not os.path.isdir(service_dir):
                 continue
-            # 有效服务判据：存在 state/config.yaml
-            state_file = os.path.join(service_dir, "state", "config.yaml")
-            if not os.path.isfile(state_file):
+            if not os.path.isfile(os.path.join(service_dir, "state", "config.yaml")):
                 continue
-            tasks.append((service_dir, entry, sub_dir))
+            _add(service_dir, entry, sub_dir)
 
     return tasks
 
@@ -553,19 +674,17 @@ def _collect_service_with_agg(service_dir: str, entry: str, timestamp: int,
     单服务采集（带聚合）。虚拟机应用产出 name 巡检结果 + 聚合条目；
     显控台/插件走旧 state/pid 逻辑，不产出聚合条目。
     """
-    if sub_dir != "":
+    if sub_dir not in ("", _XKT_SERVICE_ROOT):
+        # 插件：仍走旧 state/pid 逻辑，不产出聚合（插件没有常驻进程）
         processes = _collect_service_processes(service_dir, entry, timestamp, sub_dir)[1]
         return processes, None
 
-    # ── 虚拟机应用：name 巡检 ──
-    state = read_state(entry, sub_dir)
-    if not state:
-        return [], None
+    # ── 虚拟机应用 / 显控台：name 巡检 + 应用级聚合 ──
     version = _resolve_version(entry, sub_dir)
     if not version:
         return [], None
 
-    proc_name = _read_proc_name(entry, version)
+    proc_name = _read_proc_name(entry, version, sub_dir)
     matched = _match_processes_by_name(proc_name)
 
     processes: List[Dict[str, Any]] = []

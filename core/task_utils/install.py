@@ -285,9 +285,10 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
 
     # ── 组装脚本环境变量 ──
     # AGENT_STATE_DIR：Agent 的状态目录，脚本如有 pid/日志记账需求可用（可忽略）。
-    # ★信任脚本模式：安装位置由脚本自己决定（写死在脚本里，从下载区搬文件），
-    #   平台不再下发 INSTALL_PATH，也不要求脚本写回执——应用运行状态由
-    #   app.yaml name 的进程巡检刷新（core/process/process_info.py）。
+    # ★2026-11-05（第八轮 D6）：INSTALL_PATH 必须下发 —— 与 start.sh/stop.sh 保持一致，
+    #   也与《应用包上传说明》4.2 的要求一致（脚本用 $INSTALL_PATH 定位安装位置）。
+    #   默认值 = 运行区组件目录 {server.apps}/{应用名}（脚本可用它、也可自己改到别处）。
+    #   ★不下发时按文档写的脚本会把文件落到根目录（/runtime、/t8proc），属高危问题。
     state_dir = get_state_dir(file_name) or ""
     script_env = {
         "APP_NAME": file_name,
@@ -295,6 +296,8 @@ def install_task(parameters: Dict[str, Any], retry: int = 0, timeout: int = 300)
     }
     if state_dir:
         script_env["AGENT_STATE_DIR"] = state_dir
+    if app_dir:
+        script_env["INSTALL_PATH"] = app_dir
 
     # ── 执行安装脚本 ──
     # leave_on_timeout=True：脚本超时未退出不杀（可能在前台常驻），转后台观察，
