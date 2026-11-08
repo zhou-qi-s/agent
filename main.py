@@ -250,6 +250,28 @@ def main():
         )
         task_thread.start()
 
+        # ========== 任务线程看护（★2026-11-09 第九轮 D1） ==========
+        # 现场出现 Redis 抖动后任务线程静默退出，之后所有任务永远「执行中」。
+        # task_loop 内部已兜底，这里再做一层：线程一旦不在，30 秒内自动拉起。
+        def _task_thread_watchdog():
+            nonlocal task_thread
+            while True:
+                time.sleep(30)
+                try:
+                    if not task_thread.is_alive():
+                        logger.error("任务处理线程已退出，正在自动重启...")
+                        task_thread = threading.Thread(
+                            target=task_loop,
+                            kwargs={"timeout": 10, "enabled_types": _ENABLED_TYPES},
+                            daemon=True,
+                        )
+                        task_thread.start()
+                        logger.info("任务处理线程已重新启动")
+                except Exception as e:
+                    logger.warning(f"任务线程看护异常: {e}")
+
+        threading.Thread(target=_task_thread_watchdog, daemon=True).start()
+
         # ========== 节点资源采集线程（始终启用，写入 {server.apps}/node/runtime/resources.txt） ==========
         logger.info("启动节点资源采集线程...")
         def _node_resource_loop():

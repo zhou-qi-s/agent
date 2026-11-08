@@ -500,10 +500,23 @@ def task_loop(timeout=0, enabled_types=None):
                 fail_count = 0
                 handle_task(task, enabled_types=enabled_types)
 
-        except Exception as e:
+        except BaseException as e:
+            # ★2026-11-09（第九轮 D1）：原来是 except Exception —— 一旦抛的是
+            #   BaseException（SystemExit 之类），或者异常在 except 自己里再炸一次，
+            #   整个任务线程就静默退出，之后所有任务永远「执行中」，直到人工重启 Agent。
+            #   这里兜底成 BaseException，任何情况都不允许线程退出。
             fail_count += 1
             # 断连时不要每轮都打：前 3 次逐条打，之后每 60 次打一条
             if fail_count <= 3 or fail_count % 60 == 0:
                 logging.error(f"[任务管理] 读取任务失败(连续 {fail_count} 次): {type(e).__name__}: {e}")
+            # ★2026-11-09（第九轮 D1）：Redis 抖动后连接池里可能留着半开连接，
+            #   复用它会让 brpop 永久阻塞（日志里什么都看不到，线程像死了一样）。
+            #   连续失败 5 次就主动断开连接池，强制下一轮重建连接。
+            if fail_count >= 5 and fail_count % 5 == 0:
+                try:
+                    redisUtils.redis.connection_pool.disconnect()
+                    logging.warning("[任务管理] 已断开 Redis 连接池，下一轮重建连接")
+                except Exception as re_err:
+                    logging.warning(f"[任务管理] 断开 Redis 连接池失败: {re_err}")
             # 指数退避 1/2/4/8 秒，封顶 10 秒，避免空转把日志刷爆
             time.sleep(min(10, 2 ** min(fail_count - 1, 4)))

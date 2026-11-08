@@ -68,6 +68,51 @@ def _read_app_id(version_dir: str) -> str:
         return ""
 
 
+def _find_app_dirs(download_dir: str, sub_dir: str, service_name: str) -> dict:
+    """
+    返回 {版本号: 目录绝对路径}，同时兼容两种缓存区结构：
+
+        A. 标准：  {download}/{sub_dir}/{service_name}/{version}/
+        B. 平铺：  {download}/{sub_dir}/{service_name}.{version}/     ← 现场历史包大量是这个
+
+    ★2026-11-09（第九轮 D3/D7）：原来只认 A。现场缓存区是 B 结构（目录名里带版本），
+    于是「版本列表」查不到、"目标版本是否已下载"校验永远判否（升级/回滚被误拦），
+    "清除缓存"也找不到目录、一个字节都释放不出来。
+    这里统一解析，两个接口共用。
+    """
+    base = os.path.join(download_dir, sub_dir) if sub_dir else download_dir
+    result = {}
+    if not os.path.isdir(base):
+        return result
+
+    # A. 标准结构
+    std = os.path.join(base, service_name)
+    if os.path.isdir(std) and not os.path.islink(std):
+        try:
+            for name in os.listdir(std):
+                p = os.path.join(std, name)
+                if name.startswith(".") or not os.path.isdir(p) or os.path.islink(p):
+                    continue
+                result[name] = p
+        except OSError as e:
+            logging.warning("[缓存区] 列出目录失败: %s -> %s", std, e)
+
+    # B. 平铺结构：{service_name}.{version}
+    prefix = service_name + "."
+    try:
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if name.startswith(".") or not os.path.isdir(p) or os.path.islink(p):
+                continue
+            if name.startswith(prefix) and len(name) > len(prefix):
+                ver = name[len(prefix):]
+                # 标准结构优先，平铺只作兜底
+                result.setdefault(ver, p)
+    except OSError as e:
+        logging.warning("[缓存区] 列出目录失败: %s -> %s", base, e)
+    return result
+
+
 @router.get("/list", response_model=dict)
 async def get_service_versions(
     service_name: str = Query(..., description="应用名称")
@@ -94,26 +139,16 @@ async def get_service_versions(
     app_dir = os.path.join(download_dir, sub_dir, service_name) if sub_dir \
         else os.path.join(download_dir, service_name)
 
-    if not os.path.exists(app_dir):
+    # ★2026-11-09（第九轮 D3）：兼容「平铺目录」结构，标准结构优先
+    version_dirs = _find_app_dirs(download_dir, sub_dir, service_name)
+    if not version_dirs:
         raise HTTPException(
             status_code=404,
             detail=f"服务 '{service_name}' 的目录不存在: {app_dir}"
         )
 
-    # 列出服务目录下所有的子文件夹作为版本号
-    try:
-        versions = [
-            name for name in os.listdir(app_dir)
-            if os.path.isdir(os.path.join(app_dir, name))
-            and not os.path.islink(os.path.join(app_dir, name))
-        ]
-        # 按版本号排序（降序，新版本在前）
-        versions.sort(reverse=True)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"读取版本列表失败: {str(e)}"
-        )
+    # 按版本号排序（降序，新版本在前）
+    versions = sorted(version_dirs.keys(), reverse=True)
 
     # 读取当前正在运行的版本（来自运行区状态文件）。
     # 注意：**不再从列表里剔除**，改由调用方对比 current_version 后标记「正在使用」。
@@ -123,9 +158,9 @@ async def get_service_versions(
         current_version = str(run_state.get("version", "") or "").strip() or None
 
     # 各版本对应的平台应用记录 ID：读各自版本目录下 config/app.yaml 的 appId
-    app_ids = [_read_app_id(os.path.join(app_dir, v)) for v in versions]
+    app_ids = [_read_app_id(version_dirs[v]) for v in versions]
     # 各版本目录占用字节数（供「清除缓存」弹窗展示"可释放多少"）
-    sizes = [_dir_size(os.path.join(app_dir, v)) for v in versions]
+    sizes = [_dir_size(version_dirs[v]) for v in versions]
     logging.info("[版本列表] service=%s versions=%s app_ids=%s sizes=%s current=%s",
                  service_name, versions, app_ids, sizes, current_version)
 
@@ -204,7 +239,11 @@ async def clear_service_cache(req: ClearCacheRequest):
             detail=f"版本 {only_version} 是当前安装/运行的版本，不能清除（要删请先卸载）"
         )
 
-    if not os.path.isdir(app_dir):
+    # ★2026-11-09（第九轮 D7）：两种缓存区结构都要能清 —— 原来只认
+    #   {download}/{service}/{version}，现场是平铺的 {service}.{version}，
+    #   于是返回 deleted=[]、freed=0，"清除缓存"等于没干活。
+    version_dirs = _find_app_dirs(download_dir, sub_dir, service_name)
+    if not version_dirs:
         return {
             "code": 200,
             "message": "该应用在节点缓存区没有目录，无需清理",
@@ -223,20 +262,12 @@ async def clear_service_cache(req: ClearCacheRequest):
     deleted = []
     skipped = []
     freed = 0
-    existing_names = set(os.listdir(app_dir))
     # 请求了、但缓存区里已经找不到的版本（被并发删过 / 名字写错）
     requested = want_versions if want_versions else ([only_version] if single_mode else [])
-    missing = [v for v in requested if v not in existing_names]
+    missing = [v for v in requested if v not in version_dirs]
 
-    for name in sorted(existing_names):
-        full = os.path.join(app_dir, name)
-        if name.startswith("."):
-            # .staging 等下载中间目录：跳过，避免打断正在进行的下载
-            skipped.append({"version": name, "reason": "隐藏目录（下载中间态）"})
-            continue
-        if not os.path.isdir(full) or os.path.islink(full):
-            skipped.append({"version": name, "reason": "非版本目录"})
-            continue
+    for name in sorted(version_dirs.keys()):
+        full = version_dirs[name]
         # 指定了要删哪些版本时，其余目录原样保留（不写进 skipped，避免干扰前端提示）
         if requested and name not in requested:
             continue

@@ -43,6 +43,7 @@ from utils.app_path import (
     filter_alive_pids,
     refresh_state_pids,
     get_process_names,
+    write_state,
 )
 from utils.util import get_ip
 
@@ -369,6 +370,42 @@ def _build_process_entry(pid: int, service_name: str, version: str,
     return entry
 
 
+def _sync_state_pids(
+        service_name: str, sub_dir: str, version: str, pids: List[int]
+) -> None:
+    """
+    把巡检匹配到的 pid 回写进 state/config.yaml。
+
+    ★2026-11-09（第九轮 D4）：停止 / 卸载 / 升级都要按 state 里的 pids 去杀进程，
+    而"信任脚本模式"下包内 start.sh 不一定写 pid 文件 —— 不回写就会出现
+    「巡检看得到进程，但停止/卸载杀不掉，多版本进程并存」。
+    只有状态真的变了才落盘，避免每 10 秒写一次文件。
+    """
+    try:
+        state = read_state(service_name, sub_dir) or {}
+        cur = sorted(int(p) for p in (state.get("pids") or []) if str(p).strip())
+        new = sorted(int(p) for p in pids)
+        runtime = bool(new)
+        if cur == new and bool(state.get("runtime")) == runtime \
+                and (not version or state.get("version") == version):
+            return
+        state.update({
+            "pids": new,
+            "processes": [str(p) for p in new],
+            "name": service_name,
+            "runtime": runtime,
+            "version": version or state.get("version", ""),
+        })
+        state.pop("pid", None)
+        if write_state(service_name, state, sub_dir):
+            logging.info("[name巡检] 回写 state: %s runtime=%s pids=%s",
+                         service_name, runtime, new)
+        else:
+            logging.warning("[name巡检] 回写 state 失败: %s", service_name)
+    except Exception as e:
+        logging.warning("[name巡检] 回写 state 异常: %s -> %s", service_name, e)
+
+
 def _collect_service_processes(
         service_dir: str, entry: str, timestamp: int, sub_dir: str = ""
 ) -> Tuple[str, List[Dict[str, Any]]]:
@@ -409,6 +446,8 @@ def _collect_service_processes(
             return (entry, processes)
         proc_name = _read_proc_name(entry, version, sub_dir)
         matched = _match_processes_by_name(proc_name)
+        # ★2026-11-09（第九轮 D4）：把匹配结果回写 state，供停止/卸载按 pid 清理
+        _sync_state_pids(entry, sub_dir, version, matched)
         seen: set = set()
         for pid in matched:
             processes.append(_build_process_entry(pid, entry, version, timestamp))
@@ -686,6 +725,8 @@ def _collect_service_with_agg(service_dir: str, entry: str, timestamp: int,
 
     proc_name = _read_proc_name(entry, version, sub_dir)
     matched = _match_processes_by_name(proc_name)
+    # ★2026-11-09（第九轮 D4）：同 _collect_service_processes，回写 state 供停止/卸载使用
+    _sync_state_pids(entry, sub_dir, version, matched)
 
     processes: List[Dict[str, Any]] = []
     seen: set = set()
